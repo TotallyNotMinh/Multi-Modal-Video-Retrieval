@@ -1,3 +1,6 @@
+import os
+os.environ["HF_HUB_DISABLE_FILE_LOCKING"] = "1"
+
 import torch
 import numpy as np
 import gc

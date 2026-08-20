@@ -1,4 +1,6 @@
 import os
+os.environ["HF_HUB_DISABLE_FILE_LOCKING"] = "1"
+
 import gc
 import torch
 from typing import List, Dict, Optional
