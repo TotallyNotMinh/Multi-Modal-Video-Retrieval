@@ -56,7 +56,11 @@ class SigLIPEncoder:
         try:
             if isinstance(batch_images[0], np.ndarray):
                 stacked = np.stack(batch_images)
-                tensor_batch = torch.from_numpy(stacked).permute(0, 3, 1, 2).to(self.device, non_blocking=True)
+                # Pinned memory → non-blocking async H→D transfer maximizes PCIe bandwidth
+                cpu_tensor = torch.from_numpy(stacked).permute(0, 3, 1, 2)
+                pinned = cpu_tensor.pin_memory()
+                tensor_batch = pinned.to(self.device, non_blocking=True)
+                del cpu_tensor, pinned, stacked
                 if self.use_fp16:
                     tensor_batch = tensor_batch.half()
                 else:
@@ -64,7 +68,7 @@ class SigLIPEncoder:
                 # Direct CUDA normalization: (x / 255.0 - 0.5) / 0.5 = x / 127.5 - 1.0
                 pixel_values = tensor_batch.div_(127.5).sub_(1.0)
                 image_features = self.model.get_image_features(pixel_values=pixel_values)
-                del tensor_batch, stacked
+                del tensor_batch
             else:
                 inputs = self.processor(images=batch_images, return_tensors="pt").to(self.device)
                 if self.use_fp16:

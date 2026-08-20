@@ -101,6 +101,17 @@ def extract_keyframes_from_video(vid_path: str, target_size=(384, 384), sample_i
     return frames_rgb, meta_list
 
 
+import threading
+import queue
+
+def _prefetch_worker(vid_paths, out_queue, target_size, sample_interval_sec):
+    """CPU-side prefetch thread: decodes next video while GPU is busy encoding current one."""
+    for vid_path in vid_paths:
+        frames_rgb, meta_list = extract_keyframes_from_video(vid_path, target_size, sample_interval_sec)
+        out_queue.put((vid_path, frames_rgb, meta_list))
+    out_queue.put(None)  # sentinel
+
+
 def extract_all_siglip_features(
     videos_root: str = "data",
     output_dir: str = "cache/siglip_features",
@@ -113,7 +124,7 @@ def extract_all_siglip_features(
 ):
     """
     Extracts SigLIP-SO400M embeddings using ultra-fast PyAV keyframe decoding (~0.8s per video).
-    Supports multi-GPU sharding across isolated workers.
+    Supports multi-GPU sharding. CPU decode overlaps GPU encode via background prefetch thread.
     """
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(meta_dir, exist_ok=True)
@@ -128,47 +139,62 @@ def extract_all_siglip_features(
     if num_shards > 1:
         video_files = [f for idx, f in enumerate(video_files) if idx % num_shards == shard_id]
 
+    # Filter out already-done videos
+    pending = [f for f in video_files
+               if not (os.path.exists(os.path.join(output_dir, f"{os.path.splitext(os.path.basename(f))[0]}.npy"))
+                       and os.path.exists(os.path.join(meta_dir, f"{os.path.splitext(os.path.basename(f))[0]}.json")))]
+
     print(f"[SigLIP Extraction] Found {len(video_files)}/{total_all} video files (Shard {shard_id}/{num_shards}) on {device}.")
+    print(f"[SigLIP Extraction] {len(video_files) - len(pending)} already cached. Processing {len(pending)} remaining.")
+
+    if not pending:
+        print("[SigLIP Extraction] All videos already extracted.")
+        return
 
     total_frames_extracted = 0
     t0 = time.time()
 
-    for vid_path in tqdm(video_files, desc=f"Extracting SigLIP Shard {shard_id}"):
-        vid_name = os.path.splitext(os.path.basename(vid_path))[0]
-        out_npy = os.path.join(output_dir, f"{vid_name}.npy")
-        out_meta = os.path.join(meta_dir, f"{vid_name}.json")
+    # Start prefetch thread with queue depth 2 (decode N+1 while GPU encodes N)
+    prefetch_queue = queue.Queue(maxsize=2)
+    prefetch_thread = threading.Thread(
+        target=_prefetch_worker,
+        args=(pending, prefetch_queue, (384, 384), sample_interval_sec),
+        daemon=True
+    )
+    prefetch_thread.start()
 
-        if os.path.exists(out_npy) and os.path.exists(out_meta):
-            continue
+    with tqdm(total=len(pending), desc=f"Extracting SigLIP Shard {shard_id}") as pbar:
+        while True:
+            item = prefetch_queue.get()
+            if item is None:
+                break
 
-        frames_rgb, meta_list = extract_keyframes_from_video(
-            vid_path, target_size=(384, 384), sample_interval_sec=sample_interval_sec
-        )
-        if not frames_rgb:
-            continue
+            vid_path, frames_rgb, meta_list = item
+            vid_name = os.path.splitext(os.path.basename(vid_path))[0]
+            out_npy = os.path.join(output_dir, f"{vid_name}.npy")
+            out_meta = os.path.join(meta_dir, f"{vid_name}.json")
 
-        embeddings = encoder.encode_images(frames_rgb, batch_size=batch_size)
+            if not frames_rgb:
+                pbar.update(1)
+                continue
 
-        tmp_npy = f"{out_npy}.tmp.{os.getpid()}.npy"
-        tmp_meta = f"{out_meta}.tmp.{os.getpid()}.json"
+            embeddings = encoder.encode_images(frames_rgb, batch_size=batch_size)
 
-        np.save(tmp_npy, embeddings)
-        with open(tmp_meta, "w", encoding="utf-8") as f:
-            json.dump(meta_list, f)
+            tmp_npy = f"{out_npy}.tmp.{os.getpid()}.npy"
+            tmp_meta = f"{out_meta}.tmp.{os.getpid()}.json"
+            np.save(tmp_npy, embeddings)
+            with open(tmp_meta, "w", encoding="utf-8") as f:
+                json.dump(meta_list, f)
+            os.replace(tmp_npy, out_npy)
+            os.replace(tmp_meta, out_meta)
 
-        os.replace(tmp_npy, out_npy)
-        os.replace(tmp_meta, out_meta)
+            total_frames_extracted += len(meta_list)
+            pbar.update(1)
 
-        total_frames_extracted += len(meta_list)
-
-        del frames_rgb, meta_list, embeddings
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
+    prefetch_thread.join()
     elapsed = time.time() - t0
     print(f"\n[SigLIP Extraction] Finished! Extracted {total_frames_extracted} frames "
-          f"(scene-adaptive) in {elapsed / 60:.2f} minutes.")
+          f"in {elapsed / 60:.2f} minutes ({len(pending) / elapsed:.1f} videos/sec).")
 
 
 if __name__ == "__main__":
