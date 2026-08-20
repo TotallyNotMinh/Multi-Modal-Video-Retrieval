@@ -91,15 +91,17 @@ class WhisperASR:
 
         if is_phowhisper:
             hf_model_id = "vinai/PhoWhisper-small" if "small" in self.model_size.lower() else self.model_size
-            print(f"[WhisperASR] Loading PhoWhisper '{hf_model_id}' via HuggingFace ASR pipeline on {self.device} (float16)...")
+            print(f"[WhisperASR] Loading PhoWhisper '{hf_model_id}' via HuggingFace ASR pipeline on {self.device} (float32)...")
             try:
                 from transformers import pipeline
-                dtype = torch.float16 if ("cuda" in str(self.device) and torch.cuda.is_available()) else torch.float32
+                # Use float32 always: avoids "expected scalar type Half but found Float"
+                # when passing {"raw": np.float32_array} to a float16 pipeline.
+                # PhoWhisper-small is only 460MB, float32 (~920MB) easily fits on T4.
                 try:
                     self.model = pipeline(
                         "automatic-speech-recognition",
                         model=hf_model_id,
-                        torch_dtype=dtype,
+                        dtype=torch.float32,
                         device=self.device,
                         model_kwargs={"local_files_only": True},
                     )
@@ -107,7 +109,7 @@ class WhisperASR:
                     self.model = pipeline(
                         "automatic-speech-recognition",
                         model=hf_model_id,
-                        torch_dtype=dtype,
+                        dtype=torch.float32,
                         device=self.device,
                     )
                 self.is_hf_pipeline = True
