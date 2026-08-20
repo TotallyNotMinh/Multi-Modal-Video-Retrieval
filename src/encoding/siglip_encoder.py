@@ -52,6 +52,8 @@ class SigLIPEncoder:
                 inputs["pixel_values"] = inputs["pixel_values"].half()
 
             image_features = self.model.get_image_features(**inputs)
+            if not isinstance(image_features, torch.Tensor):
+                image_features = getattr(image_features, "pooler_output", image_features[0])
             norms = image_features.norm(dim=-1, keepdim=True).clamp(min=1e-12)
             image_features = image_features / norms
             out = image_features.cpu().numpy().astype(np.float16 if self.use_fp16 else np.float32)
@@ -127,6 +129,8 @@ class SigLIPEncoder:
         ).to(self.device)
 
         text_features = self.model.get_text_features(**inputs)
+        if not isinstance(text_features, torch.Tensor):
+            text_features = getattr(text_features, "pooler_output", text_features[0])
         norms = text_features.norm(dim=-1, keepdim=True).clamp(min=1e-12)
         text_features = text_features / norms
         feats_np = text_features.cpu().numpy().astype(np.float32)

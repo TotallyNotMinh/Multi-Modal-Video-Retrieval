@@ -24,6 +24,8 @@ class WhisperASR:
         device: Optional[str] = None,
         language: str = "vi",
         initial_batch_size: int = 64,
+        beam_size: int = 1,
+        best_of: int = 1,
     ):
         if device is None:
             self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -32,6 +34,8 @@ class WhisperASR:
 
         self.model_size = model_size
         self.language = language
+        self.beam_size = beam_size
+        self.best_of = best_of
         self._batch_size = initial_batch_size
         self.mapper = FrameMapper()
         self.model = None
@@ -149,8 +153,8 @@ class WhisperASR:
                             video_path,
                             language=self.language,
                             task="transcribe",
-                            beam_size=5,
-                            best_of=5,
+                            beam_size=self.beam_size,
+                            best_of=self.best_of,
                             vad_filter=True,
                             vad_parameters=vad_params,
                             batch_size=batch_size,
@@ -163,8 +167,8 @@ class WhisperASR:
                             video_path,
                             language=self.language,
                             task="transcribe",
-                            beam_size=5,
-                            best_of=5,
+                            beam_size=self.beam_size,
+                            best_of=self.best_of,
                             vad_filter=True,
                             vad_parameters=vad_params,
                             word_timestamps=False,
@@ -176,8 +180,8 @@ class WhisperASR:
                         video_path,
                         language=self.language,
                         task="transcribe",
-                        beam_size=5,
-                        best_of=5,
+                        beam_size=self.beam_size,
+                        best_of=self.best_of,
                         vad_filter=True,
                         vad_parameters=vad_params,
                         word_timestamps=False,

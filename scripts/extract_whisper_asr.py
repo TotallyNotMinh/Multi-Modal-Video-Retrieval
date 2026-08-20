@@ -21,6 +21,7 @@ def extract_all_whisper_asr(
     device: str = "cuda:0",
     model_size: str = "large-v3-turbo",
     batch_size: int = 32,
+    beam_size: int = 1,
     video_sample: str = None,
 ):
     """
@@ -38,6 +39,7 @@ def extract_all_whisper_asr(
         device=device,
         language="vi",
         initial_batch_size=batch_size,
+        beam_size=beam_size,
     )
 
     if video_sample and os.path.exists(video_sample):
@@ -45,7 +47,7 @@ def extract_all_whisper_asr(
     else:
         video_files = sorted(glob.glob(os.path.join(videos_root, "Videos_L*", "video", "*.mp4")))
 
-    print(f"[Whisper ASR] Found {len(video_files)} video files on device {device} using '{model_size}' (initial batch={batch_size}).")
+    print(f"[Whisper ASR] Found {len(video_files)} video files on device {device} using '{model_size}' (initial batch={batch_size}, beam_size={beam_size}).")
 
     t0 = time.time()
     for vid_path in tqdm(video_files, desc="Running faster-whisper ASR"):
@@ -76,6 +78,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--model-size", type=str, default="large-v3-turbo")
     parser.add_argument("--batch-size", type=int, default=32, help="Initial batch size (halves on OOM).")
+    parser.add_argument("--beam-size", type=int, default=1, help="Beam size (1 for fastest greedy decoding).")
     parser.add_argument("--video-sample", type=str, default=None, help="Run on a single video file.")
     args = parser.parse_args()
 
@@ -83,5 +86,6 @@ if __name__ == "__main__":
         device=args.device,
         model_size=args.model_size,
         batch_size=args.batch_size,
+        beam_size=args.beam_size,
         video_sample=args.video_sample,
     )

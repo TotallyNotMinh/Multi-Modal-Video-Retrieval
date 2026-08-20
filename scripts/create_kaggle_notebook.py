@@ -123,7 +123,7 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
                 "\n",
                 "# SigLIP starts at batch 256, Whisper starts at batch 64 (both auto-halve on OOM)\n",
                 "p1 = subprocess.Popen(['python', 'scripts/extract_siglip_features.py', '--device', 'cuda:0', '--batch-size', '256'], env=env_gpu0, cwd=repo_root)\n",
-                "p2 = subprocess.Popen(['python', 'scripts/extract_whisper_asr.py', '--device', 'cuda:0', '--batch-size', '64'], env=env_gpu1, cwd=repo_root)\n",
+                "p2 = subprocess.Popen(['python', 'scripts/extract_whisper_asr.py', '--device', 'cuda:0', '--batch-size', '64', '--beam-size', '1'], env=env_gpu1, cwd=repo_root)\n",
                 "\n",
                 "ret1 = p1.wait()\n",
                 "ret2 = p2.wait()\n",
