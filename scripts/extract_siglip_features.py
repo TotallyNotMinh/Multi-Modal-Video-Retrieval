@@ -69,46 +69,42 @@ def extract_all_siglip_features(
         all_meta = []
         curr_frame = 0
         shot_id = 0
-
         try:
             raw_fps = cap.get(cv2.CAP_PROP_FPS)
             orig_fps = float(raw_fps) if (raw_fps and not np.isnan(raw_fps) and raw_fps > 0) else 30.0
             frame_stride = max(1, int(round(orig_fps * sample_interval_sec)))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames <= 0:
+                total_frames = int(orig_fps * 1800)
 
-            while True:
-                if curr_frame % frame_stride != 0:
-                    if not cap.grab():
-                        break
-                else:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
+            frame_indices = list(range(0, total_frames, frame_stride))
 
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    rgb_resized = cv2.resize(rgb, (384, 384), interpolation=cv2.INTER_AREA)
-                    frames_batch.append(rgb_resized)
-                    meta_batch.append({
-                        # Required fields (backward-compatible schema)
-                        "video_id": vid_name,
-                        "frame_idx": curr_frame,
-                        "pts_time": curr_frame / orig_fps,
-                        "fps": orig_fps,
-                        # Additive shot fields
-                        "shot_id": shot_id,
-                        "shot_start_frame": max(0, curr_frame - frame_stride // 2),
-                        "shot_end_frame": curr_frame + frame_stride // 2,
-                    })
-                    shot_id += 1
+            for f_idx in frame_indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
 
-                    # Flush to GPU when batch is full
-                    if len(frames_batch) >= batch_size:
-                        emb = encoder.encode_images(frames_batch, batch_size=batch_size)
-                        all_embeddings.append(emb)
-                        all_meta.extend(meta_batch)
-                        frames_batch = []
-                        meta_batch = []
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb_resized = cv2.resize(rgb, (384, 384), interpolation=cv2.INTER_AREA)
+                frames_batch.append(rgb_resized)
+                meta_batch.append({
+                    "video_id": vid_name,
+                    "frame_idx": f_idx,
+                    "pts_time": f_idx / orig_fps,
+                    "fps": orig_fps,
+                    "shot_id": shot_id,
+                    "shot_start_frame": max(0, f_idx - frame_stride // 2),
+                    "shot_end_frame": f_idx + frame_stride // 2,
+                })
+                shot_id += 1
 
-                curr_frame += 1
+                if len(frames_batch) >= batch_size:
+                    emb = encoder.encode_images(frames_batch, batch_size=batch_size)
+                    all_embeddings.append(emb)
+                    all_meta.extend(meta_batch)
+                    frames_batch = []
+                    meta_batch = []
 
             # Flush remaining frames
             if frames_batch:

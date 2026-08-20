@@ -49,23 +49,36 @@ class SigLIPEncoder:
         self.model.eval()
         print(f"[SigLIPEncoder] Model loaded successfully.")
 
-    def _encode_single_chunk(self, batch_images: List[Image.Image]) -> np.ndarray:
+    def _encode_single_chunk(self, batch_images: List[Union[Image.Image, np.ndarray]]) -> np.ndarray:
         """
-        Internal chunk encoder with automatic GPU OOM handling and recursive sub-batch halving.
+        Internal chunk encoder with ultra-fast direct GPU tensor preprocessing and OOM auto-recovery.
         """
         try:
-            inputs = self.processor(images=batch_images, return_tensors="pt").to(self.device)
-            if self.use_fp16:
-                inputs["pixel_values"] = inputs["pixel_values"].half()
+            if isinstance(batch_images[0], np.ndarray):
+                stacked = np.stack(batch_images)
+                tensor_batch = torch.from_numpy(stacked).permute(0, 3, 1, 2).to(self.device, non_blocking=True)
+                if self.use_fp16:
+                    tensor_batch = tensor_batch.half()
+                else:
+                    tensor_batch = tensor_batch.float()
+                # Direct CUDA normalization: (x / 255.0 - 0.5) / 0.5 = x / 127.5 - 1.0
+                pixel_values = tensor_batch.div_(127.5).sub_(1.0)
+                image_features = self.model.get_image_features(pixel_values=pixel_values)
+                del tensor_batch, stacked
+            else:
+                inputs = self.processor(images=batch_images, return_tensors="pt").to(self.device)
+                if self.use_fp16:
+                    inputs["pixel_values"] = inputs["pixel_values"].half()
+                image_features = self.model.get_image_features(**inputs)
+                del inputs
 
-            image_features = self.model.get_image_features(**inputs)
             if not isinstance(image_features, torch.Tensor):
                 image_features = getattr(image_features, "pooler_output", image_features[0])
             norms = image_features.norm(dim=-1, keepdim=True).clamp(min=1e-12)
             image_features = image_features / norms
             out = image_features.cpu().numpy().astype(np.float16 if self.use_fp16 else np.float32)
 
-            del inputs, image_features, norms
+            del image_features, norms
             return out
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
             err_str = str(e).lower()
@@ -98,18 +111,11 @@ class SigLIPEncoder:
         if not images:
             return np.empty((0, 1152), dtype=np.float32)
 
-        pil_images = []
-        for img in images:
-            if isinstance(img, np.ndarray):
-                pil_images.append(Image.fromarray(img))
-            else:
-                pil_images.append(img)
-
         all_embeddings = []
-        total = len(pil_images)
+        total = len(images)
 
         for start_idx in range(0, total, batch_size):
-            batch = pil_images[start_idx : start_idx + batch_size]
+            batch = images[start_idx : start_idx + batch_size]
             emb = self._encode_single_chunk(batch)
             all_embeddings.append(emb)
 
