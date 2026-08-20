@@ -146,8 +146,8 @@ def extract_all_siglip_features(
         if all_embeddings:
             embeddings = np.vstack(all_embeddings)
 
-            tmp_npy = f"{out_npy}.tmp.{os.getpid()}"
-            tmp_meta = f"{out_meta}.tmp.{os.getpid()}"
+            tmp_npy = f"{out_npy}.tmp.{os.getpid()}.npy"
+            tmp_meta = f"{out_meta}.tmp.{os.getpid()}.json"
 
             np.save(tmp_npy, embeddings)
             with open(tmp_meta, "w", encoding="utf-8") as f:
