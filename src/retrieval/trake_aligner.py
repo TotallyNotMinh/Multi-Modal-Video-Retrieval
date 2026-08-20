@@ -6,10 +6,26 @@ from src.retrieval.dense_retriever import DenseRetriever
 class TRAKEAligner:
     """
     Monotonic Dynamic Programming Alignment Engine for TRAKE Queries.
-    Given N sequential sub-event queries [e_1, ..., e_N]:
-    1. Ranks candidate videos using composite event similarity.
-    2. Computes optimal strictly monotonic keyframe sequence (f_1 < f_2 < ... < f_N).
+
+    TRAKE pipeline is split into two explicit phases:
+
+    Phase 1 — Video Retrieval (this class, IN SCOPE):
+        Given N sequential sub-event queries [e_1, ..., e_N], ranks candidate videos
+        by computing an optimal strictly monotonic keyframe sequence (f_1 < f_2 < ... < f_N)
+        over the scene-adaptive FAISS index. Returns the top-K videos by alignment score.
+        The `aligned_frames` in the output are best-effort estimates from the scene index
+        (nearest sampled scene boundary frame to each event's approximate location).
+
+    Phase 2 — Exact Semantic Keyframe Localization (FUTURE WORK / VLM):
+        Once the correct video is identified by Phase 1, a VLM (e.g. Gemini, InternVL)
+        is called on the raw `.mp4` to precisely extract the N semantic keyframe indices
+        within ground-truth windows of ≤ 10 frames. This phase is NOT implemented here.
+
+    Note on current TRAKE submission quality:
+        With Phase 1 only, TRAKE R-Score is limited by the scene index resolution
+        (~1–3 frames per shot). Exact sub-10-frame window accuracy requires Phase 2 VLM.
     """
+
     def __init__(self, dense_retriever: DenseRetriever):
         self.dense_retriever = dense_retriever
         self.records = dense_retriever.records

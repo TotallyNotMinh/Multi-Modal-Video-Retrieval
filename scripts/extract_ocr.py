@@ -56,14 +56,9 @@ def extract_all_ocr(
 
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     # Pass in-memory RGB array directly to OCR
-                    try:
-                        if ocr.reader != "dummy" and ocr.reader is not None:
-                            results = ocr.reader.readtext(rgb)
-                            texts = [r[1] for r in results if len(r) > 2 and float(r[2]) > 0.3]
-                            if texts:
-                                ocr_results[f"f_{curr_frame}"] = " ".join(texts)
-                    except Exception:
-                        pass
+                    text = ocr.extract_text_from_frame(rgb)
+                    if text:
+                        ocr_results[f"f_{curr_frame}"] = text
 
                 curr_frame += 1
         finally:
@@ -75,7 +70,13 @@ def extract_all_ocr(
             json.dump(ocr_results, f, indent=2, ensure_ascii=False)
         os.replace(tmp_json, out_json)
 
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     elapsed = time.time() - t0
+
     print(f"[OCR Extraction] Finished in {elapsed/60:.2f} minutes.")
 
 if __name__ == "__main__":

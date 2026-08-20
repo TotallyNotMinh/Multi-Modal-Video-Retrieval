@@ -62,12 +62,21 @@ class SubmissionGenerator:
     def format_trake_submission(
         self,
         query_id: str,
-        aligned_predictions: List[Dict]  # List of {"video_id": ..., "aligned_frames": [f1, f2, ..., fN]}
+        aligned_predictions: List[Dict],  # List of {"video_id": ..., "aligned_frames": [f1, f2, ..., fN]}
+        num_events: Optional[int] = None
     ) -> List[str]:
         """
         Formats exactly 100 rows of <video_id>,<frame_1>,...,<frame_N>
         """
-        default_pred = {"video_id": "L21_V001", "aligned_frames": [0, 30, 60, 90]}
+        if aligned_predictions and "aligned_frames" in aligned_predictions[0]:
+            N = len(aligned_predictions[0]["aligned_frames"])
+        elif num_events is not None:
+            N = num_events
+        else:
+            N = 4
+
+        fallback_frames = [i * 30 for i in range(N)]
+        default_pred = {"video_id": "L21_V001", "aligned_frames": fallback_frames}
         padded = self._pad_predictions(aligned_predictions, default_pred, target_len=100)
         lines = []
         for pred in padded:
@@ -75,6 +84,7 @@ class SubmissionGenerator:
             frames_str = ",".join(str(f) for f in pred["aligned_frames"])
             lines.append(f"{vid},{frames_str}")
         return lines
+
 
     def save_submission_file(self, query_id: str, lines: List[str]) -> str:
         filename = f"{query_id}.csv"

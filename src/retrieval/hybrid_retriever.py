@@ -86,9 +86,11 @@ class HybridRetriever:
                 matched_frames = self.object_indexer.search_entity(token)
                 if matched_frames:
                     for i, rec in enumerate(self.records):
-                        key = f"{rec['video_id']}/{rec['keyframe_name']}"
+                        kf_name = rec.get("keyframe_name", f"{rec.get('frame_idx', 0):04d}")
+                        key = f"{rec['video_id']}/{kf_name}"
                         if key in matched_frames:
                             object_scores[i] += matched_frames[key]
+
 
         # Normalize object scores to [0, 1]
         max_obj = np.max(object_scores)

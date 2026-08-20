@@ -50,8 +50,15 @@ class VideoDecoder:
             end_frame = max(start_frame, min(int(end_sec * fps), total_frames - 1))
 
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            actual_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
 
-            current_frame = start_frame
+            # Fast grab forward if cap.set snapped to an earlier keyframe
+            while actual_pos < start_frame:
+                if not cap.grab():
+                    break
+                actual_pos += 1
+
+            current_frame = actual_pos
             while current_frame <= end_frame:
                 ret, frame = cap.read()
                 if not ret:
@@ -66,6 +73,7 @@ class VideoDecoder:
                     frame_pts.append(current_frame / fps)
 
                 current_frame += 1
+
         finally:
             cap.release()
 

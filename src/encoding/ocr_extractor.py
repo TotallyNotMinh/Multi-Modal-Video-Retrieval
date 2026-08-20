@@ -23,6 +23,25 @@ class OCRExtractor:
                 print(f"[OCRExtractor] Note: OCR running in fallback dummy mode ({e}).")
                 self.reader = "dummy"
 
+    def get_reader(self):
+        self._lazy_load_reader()
+        return self.reader
+
+    def extract_text_from_frame(self, frame_rgb) -> str:
+        """
+        Extracts concatenated text directly from an in-memory RGB numpy array.
+        """
+        self._lazy_load_reader()
+        if self.reader is None or self.reader == "dummy":
+            return ""
+
+        try:
+            results = self.reader.readtext(frame_rgb)
+            texts = [r[1] for r in results if len(r) > 2 and float(r[2]) > 0.3]
+            return " ".join(texts)
+        except Exception:
+            return ""
+
     def extract_text_from_image(self, image_path: str) -> str:
         """
         Extracts concatenated on-screen text from an image file.
@@ -50,3 +69,4 @@ class OCRExtractor:
             if text:
                 ocr_results[kf_name] = text
         return ocr_results
+

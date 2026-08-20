@@ -152,5 +152,85 @@ class TestAIC2026Pipeline(unittest.TestCase):
         hits_1d = dense.search(q_1d, top_k=5)
         self.assertEqual(len(hits_1d), 5)
 
+    def test_08_scene_detector(self):
+        """
+        Tests SceneDetector on L21_V001.mp4 (must exist at data/Videos_L21_a/video/).
+        Falls back gracefully if the video is not present (e.g. CI environment).
+        """
+        from src.encoding.scene_detector import SceneDetector
+
+        detector = SceneDetector(threshold=0.35, min_shot_frames=3)
+
+        video_path = "data/Videos_L21_a/video/L21_V001.mp4"
+        if not os.path.exists(video_path):
+            self.skipTest(f"Test video not found at {video_path} — skipping.")
+
+        shots = detector.detect_shots(video_path)
+
+        # Must detect at least one shot
+        self.assertGreater(len(shots), 0, "Expected at least one shot to be detected.")
+
+        # Every shot must have valid frame indices
+        for shot in shots:
+            self.assertIn("shot_id", shot)
+            self.assertIn("start_frame", shot)
+            self.assertIn("end_frame", shot)
+            self.assertIn("duration_sec", shot)
+            self.assertGreaterEqual(shot["end_frame"], shot["start_frame"])
+            self.assertGreaterEqual(shot["duration_sec"], 0.0)
+
+        # Test adaptive sampling policy per duration class
+        fps = 30.0
+
+        # Short shot (<1.5s): exactly 1 frame
+        short_shot = {"shot_id": 0, "start_frame": 0, "end_frame": 30, "duration_sec": 1.0}
+        short_frames = detector.get_sample_frames(short_shot, fps)
+        self.assertEqual(len(short_frames), 1, "Short shot must yield exactly 1 frame.")
+
+        # Medium shot (1.5–5s): exactly 2 frames
+        medium_shot = {"shot_id": 1, "start_frame": 0, "end_frame": 90, "duration_sec": 3.0}
+        medium_frames = detector.get_sample_frames(medium_shot, fps)
+        self.assertEqual(len(medium_frames), 2, "Medium shot must yield exactly 2 frames.")
+
+        # Long shot (>5s): at least 3 frames
+        long_shot = {"shot_id": 2, "start_frame": 0, "end_frame": 600, "duration_sec": 20.0}
+        long_frames = detector.get_sample_frames(long_shot, fps)
+        self.assertGreaterEqual(len(long_frames), 3, "Long shot must yield at least 3 frames.")
+
+        # All returned indices must be within [start_frame, end_frame]
+        for shot_case, frames in [(short_shot, short_frames), (medium_shot, medium_frames), (long_shot, long_frames)]:
+            for f in frames:
+                self.assertGreaterEqual(f, shot_case["start_frame"])
+                self.assertLessEqual(f, shot_case["end_frame"])
+
+        # Verify sorted and non-empty
+        for frames in [short_frames, medium_frames, long_frames]:
+            self.assertEqual(frames, sorted(frames), "Sample frames must be in sorted order.")
+            self.assertGreater(len(frames), 0)
+
+    def test_09_faster_whisper_asr(self):
+        """
+        Tests WhisperASR with faster-whisper initialization, fallback handling, and schema validation.
+        """
+        from src.encoding.whisper_asr import WhisperASR
+
+        # Initialize with CPU-friendly settings for fast unit testing
+        asr = WhisperASR(model_size="tiny", device="cpu", language="vi", initial_batch_size=16)
+        self.assertEqual(asr.model_size, "tiny")
+        self.assertEqual(asr.language, "vi")
+        self.assertEqual(asr._batch_size, 16)
+
+        # Test on non-existent video path (graceful empty return)
+        res_empty = asr.transcribe_video("non_existent_video.mp4")
+        self.assertEqual(res_empty, [])
+
+        # Test dummy fallback mode
+        asr_dummy = WhisperASR(model_size="dummy_test", device="cpu")
+        asr_dummy.model = "dummy"
+        res_dummy = asr_dummy.transcribe_video("any_video.mp4")
+        self.assertEqual(res_dummy, [])
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -91,3 +91,11 @@ Thumbs.db
 .vscode/
 *.swp
 *~
+
+# Kaggle Upload Archives
+kaggle_zips/
+kaggle_zips/*
+
+kaggle_uploads/
+kaggle_uploads/*
+

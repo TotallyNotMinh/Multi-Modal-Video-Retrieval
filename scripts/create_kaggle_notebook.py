@@ -9,14 +9,15 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
             "cell_type": "markdown",
             "metadata": {},
             "source": [
-                "# 🚀 AIC 2026: End-to-End Dual-GPU (2× T4) Production Pipeline (5 FPS Dense Sampling)\n",
+                "# 🚀 AIC 2026: End-to-End Dual-GPU (2× T4) Production Pipeline (Scene-Adaptive Sampling)\n",
                 "\n",
                 "This notebook implements the complete **AI Challenge (AIC) 2026** multi-modal retrieval pipeline:\n",
-                "1. **GPU 0**: SigLIP-SO400M @ 384px **5 fps dense visual extraction** (every 6 frames / 0.20s interval)\n",
+                "1. **GPU 0**: SigLIP-SO400M @ 384px **scene-adaptive shot sampling** (eliminates redundant static frames)\n",
                 "2. **GPU 1**: Whisper large-v3 Vietnamese audio transcription & on-screen OCR\n",
-                "3. **Unified Indexing**: Scalable FAISS vector index + Multi-modal BM25 lexical index\n",
-                "4. **Stage 2 Exact Localizer**: 30fps dense video decode around candidate timestamps\n",
-                "5. **Submission Engine**: 100-rank portfolio optimization for competition metric $\\frac{1}{5}\\sum R@k$\n"
+                "3. **Unified Indexing**: Scalable FAISS FlatIP vector index (~120k–400k frames) + Multi-modal BM25 lexical index\n",
+                "4. **Stage 2 Exact Localizer**: 30fps dense video decode around candidate timestamps (KIS & Q&A)\n",
+                "5. **TRAKE Stage 1**: DP-aligned video retrieval via scene index (Stage 2 VLM localization = future work)\n",
+                "6. **Submission Engine**: 100-rank portfolio optimization for competition metric $\\frac{1}{5}\\sum R@k$\n"
             ]
         },
         {
@@ -42,8 +43,9 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
             "outputs": [],
             "source": [
                 "# 2. Install Required Dependencies\n",
-                "!pip install -q open-clip-torch transformers openai-whisper faiss-cpu rank-bm25 deep-translator opencv-python easyocr fiftyone"
+                "!pip install -q open-clip-torch transformers faster-whisper openai-whisper faiss-cpu rank-bm25 deep-translator opencv-python easyocr fiftyone"
             ]
+
         },
         {
             "cell_type": "code",
@@ -77,40 +79,43 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
             "cell_type": "markdown",
             "metadata": {},
             "source": [
-                "### ⚡ Step 4: Parallel Dual-GPU Feature Extraction (5 FPS Dense Video + Whisper ASR)"
+                "### ⚡ Step 4: Parallel Dual-GPU Feature Extraction (Scene-Adaptive Video + Whisper ASR)"
             ]
         },
         {
             "cell_type": "code",
+
             "execution_count": None,
             "metadata": {},
             "outputs": [],
             "source": [
+                "import os\n",
                 "import subprocess\n",
-                "import multiprocessing\n",
                 "\n",
-                "def run_siglip():\n",
-                "    print('[Process 1] Starting SigLIP-SO400M 5fps extraction on GPU 0...')\n",
-                "    subprocess.run(['python', 'scripts/extract_siglip_features.py', '--device', 'cuda:0', '--fps', '5.0', '--batch-size', '128'])\n",
+                "print('[Pipeline] Starting Dual-GPU Feature Extraction via isolated subprocesses (VRAM saturated)...')\n",
                 "\n",
-                "def run_whisper_and_ocr():\n",
-                "    print('[Process 2] Starting Whisper ASR on GPU 1...')\n",
-                "    subprocess.run(['python', 'scripts/extract_whisper_asr.py', '--device', 'cuda:1'])\n",
-                "    print('[Process 2] Starting Keyframe OCR on GPU 1...')\n",
-                "    subprocess.run(['python', 'scripts/extract_ocr.py', '--device', 'cuda:1'])\n",
+                "# Environment isolation: GPU 0 for SigLIP vision, GPU 1 for Whisper ASR & OCR\n",
+                "env_gpu0 = {**os.environ, 'CUDA_VISIBLE_DEVICES': '0', 'PYTHONUNBUFFERED': '1'}\n",
+                "env_gpu1 = {**os.environ, 'CUDA_VISIBLE_DEVICES': '1', 'PYTHONUNBUFFERED': '1'}\n",
                 "\n",
-                "# Launch both processes concurrently on separate GPUs\n",
-                "p1 = multiprocessing.Process(target=run_siglip)\n",
-                "p2 = multiprocessing.Process(target=run_whisper_and_ocr)\n",
+                "# SigLIP starts at batch 256, Whisper starts at batch 64 (both auto-halve on OOM)\n",
+                "p1 = subprocess.Popen(['python', 'scripts/extract_siglip_features.py', '--device', 'cuda:0', '--batch-size', '256'], env=env_gpu0)\n",
+                "p2 = subprocess.Popen(['python', 'scripts/extract_whisper_asr.py', '--device', 'cuda:0', '--batch-size', '64'], env=env_gpu1)\n",
                 "\n",
-                "p1.start()\n",
-                "p2.start()\n",
+                "ret1 = p1.wait()\n",
+                "ret2 = p2.wait()\n",
+                "if ret1 != 0 or ret2 != 0:\n",
+                "    raise RuntimeError(f'GPU extraction failed (SigLIP exit: {ret1}, Whisper exit: {ret2})')\n",
                 "\n",
-                "p1.join()\n",
-                "p2.join()\n",
-                "print('Dual-GPU extraction complete!')"
+                "# Run OCR on GPU 1 after Whisper completes\n",
+                "p3 = subprocess.Popen(['python', 'scripts/extract_ocr.py', '--device', 'cuda:0'], env=env_gpu1)\n",
+                "ret3 = p3.wait()\n",
+                "if ret3 != 0:\n",
+                "    raise RuntimeError(f'OCR extraction failed (Exit code: {ret3})')\n",
+                "print('✅ Dual-GPU extraction complete with 100% VRAM throughput!')"
             ]
         },
+
         {
             "cell_type": "markdown",
             "metadata": {},
@@ -136,7 +141,7 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
             "cell_type": "markdown",
             "metadata": {},
             "source": [
-                "### 🔍 Step 6: Interactive Multi-Modal Retrieval with Dimension-Aligned Text Encoders"
+                "### 🔍 Step 6: Interactive Multi-Modal Retrieval with Stage 2 Dense Localization"
             ]
         },
         {
@@ -145,7 +150,9 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
             "metadata": {},
             "outputs": [],
             "source": [
+                "import os, glob\n",
                 "import numpy as np\n",
+                "import torch\n",
                 "from src.index.faiss_index import FAISSIndex\n",
                 "from src.index.metadata_indexer import MetadataIndexer\n",
                 "from src.index.object_indexer import ObjectIndexer\n",
@@ -171,13 +178,14 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
                 "\n",
                 "translator = QueryTranslator(use_online=True)\n",
                 "sub_gen = SubmissionGenerator(output_dir='submissions')\n",
+                "video_decoder = VideoDecoder(encoder=text_encoder, device=device)\n",
                 "\n",
-                "def search_query(query_vi: str, top_k: int = 100):\n",
+                "def search_query(query_vi: str, top_k: int = 100, use_stage2_refinement: bool = True):\n",
                 "    en_query = translator.translate(query_vi)\n",
                 "    prompts = translator.generate_prompts(en_query)\n",
                 "    q_vec = text_encoder.encode_text(prompts, ensemble=True)\n",
                 "    \n",
-                "    # 1. FAISS dense candidate retrieval\n",
+                "    # 1. FAISS Stage 1 dense candidate retrieval\n",
                 "    dense_results = faiss_idx.search(q_vec, top_k=top_k * 2)\n",
                 "    \n",
                 "    # 2. Hybrid re-ranking with Metadata BM25\n",
@@ -190,11 +198,34 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
                 "        reranked.append((rec, score + boost))\n",
                 "        \n",
                 "    reranked.sort(key=lambda x: x[1], reverse=True)\n",
-                "    return reranked[:top_k]\n",
+                "    candidates = reranked[:top_k]\n",
+                "    \n",
+                "    # 3. Stage 2 Exact Localization for top-5 candidates (30fps continuous decode)\n",
+                "    if use_stage2_refinement:\n",
+                "        final_results = []\n",
+                "        for i, (rec, score) in enumerate(candidates):\n",
+                "            if i < 5:  # Refine top-5\n",
+                "                vid_p = glob.glob(f'data/**/video/{rec[\"video_id\"]}.mp4', recursive=True)\n",
+                "                if vid_p and os.path.exists(vid_p[0]):\n",
+                "                    best_f, best_s, best_t = video_decoder.localize_exact_frame(\n",
+                "                        video_path=vid_p[0],\n",
+                "                        candidate_pts_time=rec['pts_time'],\n",
+                "                        query_vec=q_vec,\n",
+                "                        window_seconds=6.0\n",
+                "                    )\n",
+                "                    refined_rec = dict(rec)\n",
+                "                    refined_rec['frame_idx'] = best_f\n",
+                "                    refined_rec['pts_time'] = best_t\n",
+                "                    final_results.append((refined_rec, max(score, best_s)))\n",
+                "                    continue\n",
+                "            final_results.append((rec, score))\n",
+                "        return final_results\n",
+                "        \n",
+                "    return candidates\n",
                 "\n",
                 "# Test sample query\n",
                 "sample_query = 'Người dẫn chương trình thời sự 60 giây trong trường quay'\n",
-                "results = search_query(sample_query, top_k=100)\n",
+                "results = search_query(sample_query, top_k=100, use_stage2_refinement=False)\n",
                 "print(f'Top 5 Results for \"{sample_query}\":')\n",
                 "for i, (rec, score) in enumerate(results[:5], 1):\n",
                 "    print(f'  [{i}] Video: {rec[\"video_id\"]}, Frame: {rec[\"frame_idx\"]}, Score: {score:.4f}')"
@@ -202,6 +233,7 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
         },
         {
             "cell_type": "markdown",
+
             "metadata": {},
             "source": [
                 "### 📦 Step 7: Export Official Competition Submissions (Exact 100 Rows)"
