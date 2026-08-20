@@ -40,10 +40,31 @@ class WhisperASR:
         self.mapper = FrameMapper()
         self.model = None
         self.batched_pipeline = None
+        self.is_hf_pipeline = False
 
     def _lazy_load_model(self):
         if self.model is not None:
             return
+
+        is_phowhisper = "phowhisper" in self.model_size.lower() or "vinai/" in self.model_size.lower()
+
+        if is_phowhisper:
+            hf_model_id = "vinai/PhoWhisper-small" if "small" in self.model_size.lower() else self.model_size
+            print(f"[WhisperASR] Loading PhoWhisper '{hf_model_id}' via HuggingFace ASR pipeline on {self.device} (float16)...")
+            try:
+                from transformers import pipeline
+                dtype = torch.float16 if ("cuda" in str(self.device) and torch.cuda.is_available()) else torch.float32
+                self.model = pipeline(
+                    "automatic-speech-recognition",
+                    model=hf_model_id,
+                    torch_dtype=dtype,
+                    device=self.device,
+                )
+                self.is_hf_pipeline = True
+                print("[WhisperASR] PhoWhisper pipeline loaded successfully.")
+                return
+            except Exception as e:
+                print(f"[WhisperASR] HuggingFace pipeline load failed ({e}), checking faster-whisper/ctranslate2...")
 
         device_type = "cuda" if "cuda" in str(self.device) else "cpu"
         compute_type = "float16" if device_type == "cuda" else "int8"
@@ -89,6 +110,9 @@ class WhisperASR:
         if not os.path.exists(video_path) or self.model == "dummy":
             return []
 
+        if self.is_hf_pipeline:
+            return self._transcribe_with_hf_pipeline(video_path, fps)
+
         # Check if fallback model
         if not hasattr(self.model, "transcribe"):
             return []
@@ -125,6 +149,44 @@ class WhisperASR:
         # faster-whisper with adaptive VRAM saturation and OOM auto-halving
         return self._transcribe_with_auto_batch(video_path, fps)
 
+    def _transcribe_with_hf_pipeline(self, video_path: str, fps: float) -> List[Dict]:
+        """
+        Executes PhoWhisper inference via Hugging Face ASR pipeline with batched chunking.
+        """
+        video_id = os.path.splitext(os.path.basename(video_path))[0]
+        try:
+            pipe_out = self.model(
+                video_path,
+                chunk_length_s=30,
+                stride_length_s=4,
+                batch_size=max(8, self._batch_size),
+                return_timestamps=True,
+                generate_kwargs={"language": "vi", "task": "transcribe"}
+            )
+            chunks = pipe_out.get("chunks", []) if isinstance(pipe_out, dict) else []
+            if not chunks and isinstance(pipe_out, dict) and pipe_out.get("text"):
+                chunks = [{"timestamp": (0.0, 0.0), "text": pipe_out.get("text", "")}]
+
+            segments = []
+            for ch in chunks:
+                ts = ch.get("timestamp", (0.0, 0.0))
+                start_t = float(ts[0]) if ts[0] is not None else 0.0
+                end_t = float(ts[1]) if (len(ts) > 1 and ts[1] is not None) else start_t + 3.0
+                text = ch.get("text", "").strip()
+                if text:
+                    segments.append({
+                        "video_id": video_id,
+                        "start_sec": start_t,
+                        "end_sec": end_t,
+                        "start_frame": int(round(start_t * fps)),
+                        "end_frame": int(round(end_t * fps)),
+                        "text": text,
+                    })
+            return segments
+        except Exception as e:
+            print(f"[WhisperASR] PhoWhisper pipeline error on {video_path}: {e}")
+            return []
+
     def _transcribe_with_auto_batch(self, video_path: str, fps: float) -> List[Dict]:
         """
         Executes faster-whisper transcription with dynamic batch halving on OOM.
@@ -135,8 +197,8 @@ class WhisperASR:
 
         vad_params = {
             "min_silence_duration_ms": 500,
-            "speech_pad_ms": 200,
-            "threshold": 0.35,
+            "speech_pad_ms": 100,
+            "threshold": 0.50,
         }
 
         while batch_size >= 1:

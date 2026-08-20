@@ -25,20 +25,12 @@ def extract_all_siglip_features(
     device: str = "cuda:0",
     batch_size: int = 256,
     scene_threshold: float = 0.35,
-
+    num_shards: int = 1,
+    shard_id: int = 0,
 ):
     """
     Extracts SigLIP-SO400M embeddings using scene-adaptive shot sampling.
-
-    Replaces fixed 5 FPS stride with content-adaptive shot boundary detection:
-      - SceneDetector runs a sequential CPU pass (~1700 fps) to find shot boundaries.
-      - Per-shot adaptive policy selects 1–N keyframe indices (no redundant static frames).
-      - Frames are decoded sequentially with cap.grab() skipping — no cap.set() seeks,
-        which avoids I-frame snap errors in H.264 streams.
-
-    Metadata schema (backward-compatible with all downstream consumers):
-      Required: video_id, frame_idx, pts_time, fps
-      Optional: shot_id, shot_start_frame, shot_end_frame  (additive, never removed)
+    Supports multi-GPU sharding across isolated workers.
     """
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(meta_dir, exist_ok=True)
@@ -50,12 +42,16 @@ def extract_all_siglip_features(
     detector = SceneDetector(threshold=scene_threshold)
 
     video_files = sorted(glob.glob(os.path.join(videos_root, "Videos_L*", "video", "*.mp4")))
-    print(f"[SigLIP Extraction] Found {len(video_files)} video files. Scene-adaptive sampling on {device}.")
+    total_all = len(video_files)
+    if num_shards > 1:
+        video_files = [f for idx, f in enumerate(video_files) if idx % num_shards == shard_id]
+
+    print(f"[SigLIP Extraction] Found {len(video_files)}/{total_all} video files (Shard {shard_id}/{num_shards}). Scene-adaptive sampling on {device}.")
 
     total_frames_extracted = 0
     t0 = time.time()
 
-    for vid_path in tqdm(video_files, desc="Extracting SigLIP (scene-adaptive)"):
+    for vid_path in tqdm(video_files, desc=f"Extracting SigLIP Shard {shard_id}"):
         vid_name = os.path.splitext(os.path.basename(vid_path))[0]
         out_npy = os.path.join(output_dir, f"{vid_name}.npy")
         out_meta = os.path.join(meta_dir, f"{vid_name}.json")
@@ -173,8 +169,9 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--scene-threshold", type=float, default=0.35,
-
                         help="Histogram correlation drop threshold for scene cut detection (0-1).")
+    parser.add_argument("--num-shards", type=int, default=1, help="Total number of GPU shards.")
+    parser.add_argument("--shard-id", type=int, default=0, help="Current shard ID (0-indexed).")
     parser.add_argument("--video-sample", type=str, default=None,
                         help="If set, run on a single video file for debugging.")
     args = parser.parse_args()
@@ -192,10 +189,14 @@ if __name__ == "__main__":
                 device=args.device,
                 batch_size=args.batch_size,
                 scene_threshold=args.scene_threshold,
+                num_shards=args.num_shards,
+                shard_id=args.shard_id,
             )
     else:
         extract_all_siglip_features(
             device=args.device,
             batch_size=args.batch_size,
             scene_threshold=args.scene_threshold,
+            num_shards=args.num_shards,
+            shard_id=args.shard_id,
         )

@@ -18,11 +18,14 @@ def extract_all_ocr(
     videos_root: str = "data",
     output_dir: str = "cache/ocr_text",
     device: str = "cuda:0",
-    sample_interval_sec: float = 3.0
+    sample_interval_sec: float = 3.0,
+    num_shards: int = 1,
+    shard_id: int = 0,
 ):
     """
     Extracts on-screen text banners directly from MP4 videos every N seconds (e.g., 3.0s).
     Completely eliminates the need for 30GB of keyframe JPG files.
+    Supports multi-GPU sharding across isolated workers.
     """
     os.makedirs(output_dir, exist_ok=True)
     
@@ -31,10 +34,14 @@ def extract_all_ocr(
 
     ocr = OCRExtractor(device=device)
     video_files = sorted(glob.glob(os.path.join(videos_root, "Videos_L*", "video", "*.mp4")))
-    print(f"[OCR Extraction] Found {len(video_files)} video files on device {device}.")
+    total_all = len(video_files)
+    if num_shards > 1:
+        video_files = [f for idx, f in enumerate(video_files) if idx % num_shards == shard_id]
+
+    print(f"[OCR Extraction] Found {len(video_files)}/{total_all} video files (Shard {shard_id}/{num_shards}) on device {device}.")
 
     t0 = time.time()
-    for vid_path in tqdm(video_files, desc="Running Video OCR"):
+    for vid_path in tqdm(video_files, desc=f"Running OCR Shard {shard_id}"):
         vid_name = os.path.splitext(os.path.basename(vid_path))[0]
         out_json = os.path.join(output_dir, f"{vid_name}.json")
 
@@ -83,12 +90,19 @@ def extract_all_ocr(
 
     elapsed = time.time() - t0
 
-    print(f"[OCR Extraction] Finished in {elapsed/60:.2f} minutes.")
+    print(f"[OCR Extraction Shard {shard_id}] Finished in {elapsed/60:.2f} minutes.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--interval", type=float, default=3.0)
+    parser.add_argument("--num-shards", type=int, default=1, help="Total number of GPU shards.")
+    parser.add_argument("--shard-id", type=int, default=0, help="Current shard ID (0-indexed).")
     args = parser.parse_args()
 
-    extract_all_ocr(device=args.device, sample_interval_sec=args.interval)
+    extract_all_ocr(
+        device=args.device,
+        sample_interval_sec=args.interval,
+        num_shards=args.num_shards,
+        shard_id=args.shard_id,
+    )
