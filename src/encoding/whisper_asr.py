@@ -7,25 +7,64 @@ from typing import List, Dict, Optional
 from src.index.frame_mapper import FrameMapper
 
 
+import numpy as np
+
+def extract_audio_from_video(video_path: str, target_sr: int = 16000) -> Optional[np.ndarray]:
+    """
+    Extracts 16kHz mono float32 audio array from an MP4 video file in ~0.2s using PyAV.
+    Falls back to ffmpeg subprocess if needed.
+    """
+    try:
+        import av
+        container = av.open(video_path)
+        if not container.streams.audio:
+            container.close()
+            return None
+        stream = container.streams.audio[0]
+        resampler = av.AudioResampler(format="fltp", layout="mono", rate=target_sr)
+        chunks = []
+        for frame in container.decode(stream):
+            resampled = resampler.resample(frame)
+            if resampled:
+                for r in resampled:
+                    chunks.append(r.to_ndarray())
+        container.close()
+        if chunks:
+            arr = np.concatenate(chunks, axis=1)[0].astype(np.float32)
+            # Normalize to [-1.0, 1.0] if needed
+            max_val = np.max(np.abs(arr))
+            if max_val > 1.0:
+                arr = arr / max_val
+            return arr
+        return None
+    except Exception:
+        pass
+
+    # Fallback: ffmpeg subprocess
+    try:
+        import subprocess, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+            cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", str(target_sr), "-ac", "1", tmp.name]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            import soundfile as sf
+            audio, sr = sf.read(tmp.name)
+            return audio.astype(np.float32)
+    except Exception:
+        return None
+
+
 class WhisperASR:
     """
     High-throughput Automatic Speech Recognition for Vietnamese video audio using
-    faster-whisper (CTranslate2) with large-v3-turbo / large-v3.
-
-    VRAM Maximization & Auto-Batch OOM Recovery:
-      - Starts with maximum batch size (e.g. 64 / 32) to saturate GPU memory and maximize throughput.
-      - Uses faster_whisper.BatchedInferencePipeline for high-concurrency transformer decoding.
-      - Silero VAD pre-filter eliminates non-speech audio (silence/music).
-      - Automatically catches CUDA Out-Of-Memory and dynamic memory pressure, halving the
-        batch size: 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1, then persisting the stable batch size.
+    PhoWhisper (HuggingFace) or faster-whisper (CTranslate2).
     """
 
     def __init__(
         self,
-        model_size: str = "large-v3-turbo",
+        model_size: str = "vinai/PhoWhisper-small",
         device: Optional[str] = None,
         language: str = "vi",
-        initial_batch_size: int = 64,
+        initial_batch_size: int = 32,
         beam_size: int = 1,
         best_of: int = 1,
     ):
@@ -115,7 +154,6 @@ class WhisperASR:
     ) -> List[Dict]:
         """
         Transcribes audio from an MP4 video file and returns aligned segments.
-        Auto-halves batch size dynamically upon CUDA out-of-memory errors until it succeeds.
         """
         self._lazy_load_model()
         if not os.path.exists(video_path) or self.model == "dummy":
@@ -163,11 +201,16 @@ class WhisperASR:
     def _transcribe_with_hf_pipeline(self, video_path: str, fps: float) -> List[Dict]:
         """
         Executes PhoWhisper inference via Hugging Face ASR pipeline with batched chunking.
+        Extracts 16kHz audio in-memory to prevent soundfile MP4 decoding failures.
         """
         video_id = os.path.splitext(os.path.basename(video_path))[0]
         try:
+            audio_array = extract_audio_from_video(video_path, target_sr=16000)
+            if audio_array is None or len(audio_array) == 0:
+                return []
+
             pipe_out = self.model(
-                video_path,
+                {"raw": audio_array, "sampling_rate": 16000},
                 chunk_length_s=30,
                 stride_length_s=4,
                 batch_size=max(8, self._batch_size),
