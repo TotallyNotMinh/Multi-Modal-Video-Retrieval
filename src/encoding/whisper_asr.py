@@ -54,12 +54,21 @@ class WhisperASR:
             try:
                 from transformers import pipeline
                 dtype = torch.float16 if ("cuda" in str(self.device) and torch.cuda.is_available()) else torch.float32
-                self.model = pipeline(
-                    "automatic-speech-recognition",
-                    model=hf_model_id,
-                    torch_dtype=dtype,
-                    device=self.device,
-                )
+                try:
+                    self.model = pipeline(
+                        "automatic-speech-recognition",
+                        model=hf_model_id,
+                        torch_dtype=dtype,
+                        device=self.device,
+                        model_kwargs={"local_files_only": True},
+                    )
+                except Exception:
+                    self.model = pipeline(
+                        "automatic-speech-recognition",
+                        model=hf_model_id,
+                        torch_dtype=dtype,
+                        device=self.device,
+                    )
                 self.is_hf_pipeline = True
                 print("[WhisperASR] PhoWhisper pipeline loaded successfully.")
                 return

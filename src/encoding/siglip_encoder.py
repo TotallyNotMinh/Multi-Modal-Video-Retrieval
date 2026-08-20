@@ -32,8 +32,12 @@ class SigLIPEncoder:
         self.model_name = model_name
 
         print(f"[SigLIPEncoder] Loading {model_name} on {self.device} (FP16={self.use_fp16})...")
-        self.processor = AutoProcessor.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)
+        try:
+            self.processor = AutoProcessor.from_pretrained(model_name, local_files_only=True)
+            self.model = AutoModel.from_pretrained(model_name, local_files_only=True)
+        except Exception:
+            self.processor = AutoProcessor.from_pretrained(model_name)
+            self.model = AutoModel.from_pretrained(model_name)
 
         if self.use_fp16:
             self.model = self.model.half()
