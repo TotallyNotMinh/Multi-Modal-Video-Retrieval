@@ -53,7 +53,7 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
             "outputs": [],
             "source": [
                 "# 2. Install Required Dependencies\n",
-                "!pip install -q open-clip-torch transformers faster-whisper openai-whisper faiss-cpu rank-bm25 deep-translator opencv-python easyocr fiftyone"
+                "!pip install -q 'pillow<11.0.0' open-clip-torch transformers faster-whisper openai-whisper faiss-cpu rank-bm25 deep-translator opencv-python easyocr fiftyone"
             ]
 
         },
