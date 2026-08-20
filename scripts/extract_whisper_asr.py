@@ -1,4 +1,5 @@
 import os
+import sys
 import gc
 import glob
 import json
@@ -6,7 +7,12 @@ import time
 import argparse
 import torch
 from tqdm import tqdm
+
+# Ensure repo root is always in sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from src.encoding.whisper_asr import WhisperASR
+
 
 
 def extract_all_whisper_asr(

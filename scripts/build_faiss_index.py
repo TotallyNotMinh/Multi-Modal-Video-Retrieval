@@ -1,12 +1,18 @@
 import os
+import sys
 import gc
 import glob
 import json
 import pickle
 import numpy as np
 from tqdm import tqdm
+
+# Ensure repo root is always in sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from src.index.faiss_index import FAISSIndex
 from src.index.matrix_builder import FeatureMatrixBuilder
+
 
 def build_production_faiss_index(
     siglip_dir: str = "cache/siglip_features",

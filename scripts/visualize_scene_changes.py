@@ -6,7 +6,11 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
+# Ensure repo root is always in sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from src.encoding.scene_detector import SceneDetector
+
 
 
 def draw_hud(

@@ -26,14 +26,24 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
             "metadata": {},
             "outputs": [],
             "source": [
-                "# 1. Verify Dual GPU Hardware (2x NVIDIA T4)\n",
+                "# 1. Verify Dual GPU Hardware (2x NVIDIA T4) & Setup Working Directory\n",
                 "import torch, os, sys\n",
-                "num_gpus = torch.cuda.device_count()\n",
-                "print(f\"Detected {num_gpus} CUDA GPUs:\")\n",
-                "for i in range(num_gpus):\n",
-                "    print(f\"  GPU {i}: {torch.cuda.get_device_name(i)} (VRAM: {torch.cuda.get_device_properties(i).total_memory / 1e9:.2f} GB)\")\n",
                 "\n",
-                "assert num_gpus >= 1, \"Please enable GPU accelerator in Kaggle Settings (2x T4 recommended)!\""
+                "# Navigate into cloned repository if present\n",
+                "REPO_DIR = '/kaggle/working/aic2026'\n",
+                "if os.path.exists(REPO_DIR):\n",
+                "    os.chdir(REPO_DIR)\n",
+                "    print(f'Active working directory set to: {os.getcwd()}')\n",
+                "\n",
+                "if os.getcwd() not in sys.path:\n",
+                "    sys.path.insert(0, os.getcwd())\n",
+                "\n",
+                "num_gpus = torch.cuda.device_count()\n",
+                "print(f'Detected {num_gpus} CUDA GPUs:')\n",
+                "for i in range(num_gpus):\n",
+                "    print(f'  GPU {i}: {torch.cuda.get_device_name(i)} (VRAM: {torch.cuda.get_device_properties(i).total_memory / 1e9:.2f} GB)')\n",
+                "\n",
+                "assert num_gpus >= 1, 'Please enable GPU accelerator in Kaggle Settings (2x T4 recommended)!'"
             ]
         },
         {
@@ -53,28 +63,39 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
             "metadata": {},
             "outputs": [],
             "source": [
-                "# 3. Symlink / Prepare Data Directories from Kaggle Input\n",
+                "# 3. Symlink / Prepare Data Directories from Kaggle Input into aic2026/data\n",
                 "import os, glob\n",
                 "\n",
+                "target_dir = os.path.join(os.getcwd(), 'data')\n",
+                "os.makedirs(target_dir, exist_ok=True)\n",
+                "\n",
                 "if os.path.exists('/kaggle/input'):\n",
-                "    print('Detected Kaggle environment. Linking input directories...')\n",
-                "    os.makedirs('data', exist_ok=True)\n",
+                "    print(f'Detected Kaggle environment. Linking input datasets into {target_dir}...')\n",
                 "    for p in glob.glob('/kaggle/input/**/Videos_*', recursive=True):\n",
-                "        dest = os.path.join('data', os.path.basename(p))\n",
+                "        dest = os.path.join(target_dir, os.path.basename(p))\n",
                 "        if not os.path.exists(dest):\n",
                 "            os.symlink(p, dest)\n",
                 "    for p in glob.glob('/kaggle/input/**/Keyframes_*', recursive=True):\n",
-                "        dest = os.path.join('data', os.path.basename(p))\n",
+                "        dest = os.path.join(target_dir, os.path.basename(p))\n",
+                "        if not os.path.exists(dest):\n",
+                "            os.symlink(p, dest)\n",
+                "    for p in glob.glob('/kaggle/input/**/*media-info*', recursive=True):\n",
+                "        dest = os.path.join(target_dir, os.path.basename(p))\n",
+                "        if not os.path.exists(dest):\n",
+                "            os.symlink(p, dest)\n",
+                "    for p in glob.glob('/kaggle/input/**/*map-keyframes*', recursive=True):\n",
+                "        dest = os.path.join(target_dir, os.path.basename(p))\n",
                 "        if not os.path.exists(dest):\n",
                 "            os.symlink(p, dest)\n",
                 "    for p in glob.glob('/kaggle/input/**/*-aic25-b1', recursive=True):\n",
-                "        dest = os.path.join('data', os.path.basename(p))\n",
+                "        dest = os.path.join(target_dir, os.path.basename(p))\n",
                 "        if not os.path.exists(dest):\n",
                 "            os.symlink(p, dest)\n",
                 "\n",
-                "print('Data directory contents:', os.listdir('data') if os.path.exists('data') else 'None')"
+                "print(f'Linked data contents ({target_dir}):', sorted(os.listdir(target_dir)))"
             ]
         },
+
         {
             "cell_type": "markdown",
             "metadata": {},
@@ -94,13 +115,15 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
                 "\n",
                 "print('[Pipeline] Starting Dual-GPU Feature Extraction via isolated subprocesses (VRAM saturated)...')\n",
                 "\n",
-                "# Environment isolation: GPU 0 for SigLIP vision, GPU 1 for Whisper ASR & OCR\n",
-                "env_gpu0 = {**os.environ, 'CUDA_VISIBLE_DEVICES': '0', 'PYTHONUNBUFFERED': '1'}\n",
-                "env_gpu1 = {**os.environ, 'CUDA_VISIBLE_DEVICES': '1', 'PYTHONUNBUFFERED': '1'}\n",
+                "repo_root = os.getcwd() if os.path.exists('src') else ('/kaggle/working/aic2026' if os.path.exists('/kaggle/working/aic2026') else '.')\n",
+                "\n",
+                "# Environment isolation: GPU 0 for SigLIP vision, GPU 1 for Whisper ASR & OCR with PYTHONPATH\n",
+                "env_gpu0 = {**os.environ, 'CUDA_VISIBLE_DEVICES': '0', 'PYTHONUNBUFFERED': '1', 'PYTHONPATH': repo_root}\n",
+                "env_gpu1 = {**os.environ, 'CUDA_VISIBLE_DEVICES': '1', 'PYTHONUNBUFFERED': '1', 'PYTHONPATH': repo_root}\n",
                 "\n",
                 "# SigLIP starts at batch 256, Whisper starts at batch 64 (both auto-halve on OOM)\n",
-                "p1 = subprocess.Popen(['python', 'scripts/extract_siglip_features.py', '--device', 'cuda:0', '--batch-size', '256'], env=env_gpu0)\n",
-                "p2 = subprocess.Popen(['python', 'scripts/extract_whisper_asr.py', '--device', 'cuda:0', '--batch-size', '64'], env=env_gpu1)\n",
+                "p1 = subprocess.Popen(['python', 'scripts/extract_siglip_features.py', '--device', 'cuda:0', '--batch-size', '256'], env=env_gpu0, cwd=repo_root)\n",
+                "p2 = subprocess.Popen(['python', 'scripts/extract_whisper_asr.py', '--device', 'cuda:0', '--batch-size', '64'], env=env_gpu1, cwd=repo_root)\n",
                 "\n",
                 "ret1 = p1.wait()\n",
                 "ret2 = p2.wait()\n",
@@ -108,13 +131,14 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
                 "    raise RuntimeError(f'GPU extraction failed (SigLIP exit: {ret1}, Whisper exit: {ret2})')\n",
                 "\n",
                 "# Run OCR on GPU 1 after Whisper completes\n",
-                "p3 = subprocess.Popen(['python', 'scripts/extract_ocr.py', '--device', 'cuda:0'], env=env_gpu1)\n",
+                "p3 = subprocess.Popen(['python', 'scripts/extract_ocr.py', '--device', 'cuda:0'], env=env_gpu1, cwd=repo_root)\n",
                 "ret3 = p3.wait()\n",
                 "if ret3 != 0:\n",
                 "    raise RuntimeError(f'OCR extraction failed (Exit code: {ret3})')\n",
                 "print('✅ Dual-GPU extraction complete with 100% VRAM throughput!')"
             ]
         },
+
 
         {
             "cell_type": "markdown",
@@ -252,8 +276,45 @@ def create_kaggle_notebook(output_path: str = "notebooks/AIC_2026_Kaggle_Pipelin
                 "zip_path = sub_gen.package_submission_zip('AIC2026_Submission_Bundle.zip')\n",
                 "print(f'Official Submission Package Ready: {zip_path} (Contains {len(lines)} rows in query_01.csv)')"
             ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "### 📥 Step 8: Package & Download All Encoded Features (Visual, Audio ASR, OCR & FAISS Indices)\n",
+                "\n",
+                "Compresses all generated `.npy` visual embeddings, Whisper transcripts, OCR text, and FAISS indices into a single downloadable ZIP archive in `/kaggle/working/`."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "import os, zipfile\n",
+                "from IPython.display import FileLink\n",
+                "\n",
+                "zip_filename = 'aic2026_features_and_cache.zip'\n",
+                "zip_path = os.path.join('/kaggle/working' if os.path.exists('/kaggle/working') else '.', zip_filename)\n",
+                "\n",
+                "print(f'[Export] Packaging cache directory into {zip_path}...')\n",
+                "with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:\n",
+                "    for root, dirs, files in os.walk('cache'):\n",
+                "        for file in files:\n",
+                "            if file.endswith(('.npy', '.json', '.index', '.pkl')) and '.tmp.' not in file:\n",
+                "                abs_path = os.path.join(root, file)\n",
+                "                rel_path = os.path.relpath(abs_path, '.')\n",
+                "                zf.write(abs_path, arcname=rel_path)\n",
+                "\n",
+                "zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)\n",
+                "print(f'✅ All features successfully packaged! Total Archive Size: {zip_size_mb:.2f} MB')\n",
+                "print(f'Artifact saved at: {zip_path}')\n",
+                "FileLink(zip_filename)"
+            ]
         }
     ]
+
 
     notebook_json = {
         "cells": cells,

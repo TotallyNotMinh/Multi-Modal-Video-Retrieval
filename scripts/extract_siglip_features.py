@@ -1,4 +1,5 @@
 import os
+import sys
 import gc
 import glob
 import json
@@ -8,8 +9,13 @@ import cv2
 import torch
 import numpy as np
 from tqdm import tqdm
+
+# Ensure repo root is always in sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from src.encoding.siglip_encoder import SigLIPEncoder
 from src.encoding.scene_detector import SceneDetector
+
 
 
 def extract_all_siglip_features(
