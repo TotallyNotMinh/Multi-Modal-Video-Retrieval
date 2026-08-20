@@ -24,12 +24,13 @@ def extract_all_siglip_features(
     meta_dir: str = "cache/siglip_meta",
     device: str = "cuda:0",
     batch_size: int = 256,
-    scene_threshold: float = 0.35,
+    sample_interval_sec: float = 1.5,
     num_shards: int = 1,
     shard_id: int = 0,
 ):
     """
-    Extracts SigLIP-SO400M embeddings using scene-adaptive shot sampling.
+    Extracts SigLIP-SO400M embeddings using high-speed single-pass keyframe sampling.
+    Decodes ~800 frames per 20-min video via fast cap.grab() strides (~5s per video).
     Supports multi-GPU sharding across isolated workers.
     """
     os.makedirs(output_dir, exist_ok=True)
@@ -39,14 +40,13 @@ def extract_all_siglip_features(
         device = "cpu"
 
     encoder = SigLIPEncoder(device=device, use_fp16=True)
-    detector = SceneDetector(threshold=scene_threshold)
 
     video_files = sorted(glob.glob(os.path.join(videos_root, "Videos_L*", "video", "*.mp4")))
     total_all = len(video_files)
     if num_shards > 1:
         video_files = [f for idx, f in enumerate(video_files) if idx % num_shards == shard_id]
 
-    print(f"[SigLIP Extraction] Found {len(video_files)}/{total_all} video files (Shard {shard_id}/{num_shards}). Scene-adaptive sampling on {device}.")
+    print(f"[SigLIP Extraction] Found {len(video_files)}/{total_all} video files (Shard {shard_id}/{num_shards}) on {device}.")
 
     total_frames_extracted = 0
     t0 = time.time()
@@ -59,11 +59,6 @@ def extract_all_siglip_features(
         if os.path.exists(out_npy) and os.path.exists(out_meta):
             continue
 
-        # --- Pass 1: Scene detection (sequential, CPU, ~1700 fps) ---
-        shots = detector.detect_shots(vid_path)
-        if not shots:
-            continue
-
         cap = cv2.VideoCapture(vid_path)
         if not cap.isOpened():
             continue
@@ -72,63 +67,48 @@ def extract_all_siglip_features(
         meta_batch = []
         all_embeddings = []
         all_meta = []
+        curr_frame = 0
+        shot_id = 0
 
         try:
             raw_fps = cap.get(cv2.CAP_PROP_FPS)
             orig_fps = float(raw_fps) if (raw_fps and not np.isnan(raw_fps) and raw_fps > 0) else 30.0
+            frame_stride = max(1, int(round(orig_fps * sample_interval_sec)))
 
-            # Build a sorted set of (frame_idx -> shot_dict) for O(1) lookup
-            target_map: dict[int, dict] = {}
-            for shot in shots:
-                for f in detector.get_sample_frames(shot, orig_fps):
-                    target_map[f] = shot
-
-            if not target_map:
-                continue
-
-            sorted_targets = sorted(target_map.keys())
-            target_iter = iter(sorted_targets)
-            next_target = next(target_iter, None)
-
-            curr_frame = 0
-            # --- Pass 2: Sequential decode, grab()-skip non-target frames ---
-            while next_target is not None:
-                if curr_frame < next_target:
+            while True:
+                if curr_frame % frame_stride != 0:
                     if not cap.grab():
                         break
-                    curr_frame += 1
-                    continue
+                else:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
 
-                ret, frame = cap.read()
-                if not ret:
-                    break
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    rgb_resized = cv2.resize(rgb, (384, 384), interpolation=cv2.INTER_AREA)
+                    frames_batch.append(rgb_resized)
+                    meta_batch.append({
+                        # Required fields (backward-compatible schema)
+                        "video_id": vid_name,
+                        "frame_idx": curr_frame,
+                        "pts_time": curr_frame / orig_fps,
+                        "fps": orig_fps,
+                        # Additive shot fields
+                        "shot_id": shot_id,
+                        "shot_start_frame": max(0, curr_frame - frame_stride // 2),
+                        "shot_end_frame": curr_frame + frame_stride // 2,
+                    })
+                    shot_id += 1
 
-                shot = target_map[curr_frame]
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                rgb_resized = cv2.resize(rgb, (384, 384), interpolation=cv2.INTER_AREA)
-                frames_batch.append(rgb_resized)
-                meta_batch.append({
-                    # Required fields (backward-compatible schema)
-                    "video_id": vid_name,
-                    "frame_idx": curr_frame,
-                    "pts_time": curr_frame / orig_fps,
-                    "fps": orig_fps,
-                    # Additive shot fields (never replace existing keys)
-                    "shot_id": shot["shot_id"],
-                    "shot_start_frame": shot["start_frame"],
-                    "shot_end_frame": shot["end_frame"],
-                })
+                    # Flush to GPU when batch is full
+                    if len(frames_batch) >= batch_size:
+                        emb = encoder.encode_images(frames_batch, batch_size=batch_size)
+                        all_embeddings.append(emb)
+                        all_meta.extend(meta_batch)
+                        frames_batch = []
+                        meta_batch = []
 
-                next_target = next(target_iter, None)
                 curr_frame += 1
-
-                # Flush to GPU when batch is full
-                if len(frames_batch) >= batch_size:
-                    emb = encoder.encode_images(frames_batch, batch_size=batch_size)
-                    all_embeddings.append(emb)
-                    all_meta.extend(meta_batch)
-                    frames_batch = []
-                    meta_batch = []
 
             # Flush remaining frames
             if frames_batch:
@@ -168,8 +148,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--scene-threshold", type=float, default=0.35,
-                        help="Histogram correlation drop threshold for scene cut detection (0-1).")
+    parser.add_argument("--interval", "--sample-interval-sec", type=float, default=1.5,
+                        help="Sampling interval in seconds between keyframes.")
+    parser.add_argument("--scene-threshold", type=float, default=0.35, help="Legacy alias.")
     parser.add_argument("--num-shards", type=int, default=1, help="Total number of GPU shards.")
     parser.add_argument("--shard-id", type=int, default=0, help="Current shard ID (0-indexed).")
     parser.add_argument("--video-sample", type=str, default=None,
@@ -188,7 +169,7 @@ if __name__ == "__main__":
                 meta_dir="cache/siglip_meta",
                 device=args.device,
                 batch_size=args.batch_size,
-                scene_threshold=args.scene_threshold,
+                sample_interval_sec=args.interval,
                 num_shards=args.num_shards,
                 shard_id=args.shard_id,
             )
@@ -196,7 +177,7 @@ if __name__ == "__main__":
         extract_all_siglip_features(
             device=args.device,
             batch_size=args.batch_size,
-            scene_threshold=args.scene_threshold,
+            sample_interval_sec=args.interval,
             num_shards=args.num_shards,
             shard_id=args.shard_id,
         )
