@@ -1,6 +1,6 @@
 # 🇻🇳 AIC 2026 - Multi-Modal Video Retrieval Studio
 
-An end-to-end, high-throughput multi-modal video retrieval and analysis platform tailored for the **AI Challenge (AIC) 2026**.
+An end-to-end, high-throughput multi-modal video retrieval and analysis platform.
 
 The system combines **SigLIP dense visual feature search**, **PhoWhisper ASR speech transcription**, **PaddleOCR on-screen text extraction**, **BM25 inverted lexical indexing**, and an interactive real-time web studio for **KIS (Known-Item Search)**, **Q&A**, and **TRAKE (Temporal Action Event Localization)**.
 
