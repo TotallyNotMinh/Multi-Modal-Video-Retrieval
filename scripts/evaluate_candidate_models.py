@@ -20,8 +20,11 @@ import re
 import argparse
 from typing import List, Dict, Any
 
-# Bypass broken torchvision op registrations in Kaggle/custom environments
-for _mod in ["torchvision", "torchvision.io", "torchvision.ops", "torchvision._meta_registrations"]:
+# Bypass broken torchvision and torchaudio op registrations in Kaggle/custom environments
+for _mod in [
+    "torchvision", "torchvision.io", "torchvision.ops", "torchvision._meta_registrations",
+    "torchaudio", "torchaudio._extension", "torchaudio._extension.utils", "torchaudio.lib", "torchaudio.lib._torchaudio",
+]:
     sys.modules[_mod] = None
 
 # Ensure repo root is in sys.path
