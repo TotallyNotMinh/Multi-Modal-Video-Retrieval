@@ -77,9 +77,9 @@ CANDIDATE_CONFIGS = [
         "quantization": None,
     },
     {
-        "id": "qwen3-14b-4bit",
-        "display_name": "Qwen3-14B (4-bit Quantized)",
-        "model_id": "Qwen/Qwen3-14B",
+        "id": "qwen2.5-14b-4bit",
+        "display_name": "Qwen2.5-14B-Instruct (4-bit Quantized)",
+        "model_id": "Qwen/Qwen2.5-14B-Instruct",
         "quantization": "4bit",
     },
 ]
@@ -144,8 +144,10 @@ def evaluate_single_model(cand: Dict[str, Any], segments: List[str], device: str
     t0 = time.time()
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
+    device_map = "auto" if device == "auto" else ({"": device} if device else "auto")
     load_kwargs: Dict[str, Any] = {
         "trust_remote_code": True,
+        "device_map": device_map,
     }
 
     if quant == "4bit":
@@ -157,17 +159,11 @@ def evaluate_single_model(cand: Dict[str, Any], segments: List[str], device: str
             bnb_4bit_use_double_quant=True,
         )
         load_kwargs["quantization_config"] = bnb_config
-        load_kwargs["device_map"] = {"": device}
         model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
     else:
         dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
-        load_kwargs["dtype"] = dtype
-        try:
-            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs).to(device)
-        except TypeError:
-            if "dtype" in load_kwargs:
-                load_kwargs["torch_dtype"] = load_kwargs.pop("dtype")
-            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs).to(device)
+        load_kwargs["torch_dtype"] = dtype
+        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
     model.eval()
     load_time = time.time() - t0
     print(f"✓ Model loaded in {load_time:.2f}s")
@@ -193,7 +189,8 @@ def evaluate_single_model(cand: Dict[str, Any], segments: List[str], device: str
             add_generation_prompt=True,
         )
 
-    inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+    target_device = model.device if hasattr(model, "device") else (device if device != "auto" else "cuda:0")
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(target_device)
 
     # Measure Generation Time
     t_gen_start = time.time()
@@ -234,14 +231,19 @@ def evaluate_single_model(cand: Dict[str, Any], segments: List[str], device: str
 
 
 def main():
+    import torch
     parser = argparse.ArgumentParser(description="Evaluate top candidate LLMs on Vietnamese transcript refinement.")
-    parser.add_argument("--device", type=str, default="cuda:0" if __import__("torch").cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="auto", help="Device mapping strategy: 'auto' (multi-GPU sharding across all GPUs) or specific device e.g. 'cuda:0', 'cpu'")
     parser.add_argument("--models", nargs="+", default=None, help="Filter specific model IDs")
     args = parser.parse_args()
 
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    gpu_names = [torch.cuda.get_device_name(i) for i in range(num_gpus)] if num_gpus > 0 else ["CPU"]
+
     print("=" * 80)
     print(" 🇻🇳 TOP CANDIDATE VIETNAMESE ASR REFINEMENT ARENA")
-    print(f" Device: {args.device} | Benchmark Samples: {len(BENCHMARK_SEGMENTS)} Segments")
+    print(f" GPUs Detected: {num_gpus} ({', '.join(gpu_names)})")
+    print(f" Device Strategy: {args.device} | Benchmark Samples: {len(BENCHMARK_SEGMENTS)} Segments")
     print("=" * 80)
 
     selected_cands = CANDIDATE_CONFIGS
