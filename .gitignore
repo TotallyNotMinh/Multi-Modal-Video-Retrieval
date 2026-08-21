@@ -99,3 +99,4 @@ kaggle_zips/*
 kaggle_uploads/
 kaggle_uploads/*
 
+debug_outputs/

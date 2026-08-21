@@ -81,26 +81,36 @@ class TestAIC2026Pipeline(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             sub = SubmissionGenerator(output_dir=tmpdir)
             
-            # Test padding when only 10 candidates provided
-            few_preds = [{"video_id": "L21_V001", "frame_idx": i * 30} for i in range(10)]
-            lines = sub.format_kis_submission("q01", few_preds)
+            # Test video extension cleaning and padding when only 10 candidates provided
+            few_preds = [{"video_id": "data/Videos_L21/video/L21_V001.mp4", "frame_idx": i * 30} for i in range(10)]
+            lines = sub.format_kis_submission("query-1-kis", few_preds)
             self.assertEqual(len(lines), 100)  # Must be padded to exactly 100 rows
-            sub.save_submission_file("q01", lines)
+            self.assertEqual(lines[0], "L21_V001,0")  # Stripped path and .mp4 extension
+            sub.save_submission_file("query-1-kis", lines)
 
-            # Test Q&A comma escaping
-            qa_preds = [{"video_id": "L21_V001", "frame_idx": 100, "answer": "màu xanh, đậm\n"}]
-            qa_lines = sub.format_qa_submission("qa01", qa_preds)
+            # Test Q&A comma escaping and max 100 char enforcement
+            long_ans = "màu xanh, đậm " + ("và rất sáng " * 15)
+            qa_preds = [{"video_id": "L21_V001.mp4", "frame_idx": 100, "answer": long_ans}]
+            qa_lines = sub.format_qa_submission("query-2-qa", qa_preds)
             self.assertEqual(len(qa_lines), 100)
-            self.assertIn('"màu xanh, đậm"', qa_lines[0])
+            self.assertTrue(len(qa_lines[0].split(",")[-1]) <= 102) # with quotes
+            self.assertTrue(qa_lines[0].startswith("L21_V001,100,\"màu xanh, đậm"))
+            sub.save_submission_file("query-2-qa", qa_lines)
 
             # Test TRAKE submission
-            trake_preds = [{"video_id": "L21_V001", "aligned_frames": [100, 200, 300, 400]}]
-            t_lines = sub.format_trake_submission("trake01", trake_preds)
+            trake_preds = [{"video_id": "L21_V001.mp4", "aligned_frames": [100, 200, 300, 400]}]
+            t_lines = sub.format_trake_submission("query-3-trake", trake_preds)
             self.assertEqual(len(t_lines), 100)
             self.assertEqual(t_lines[0], "L21_V001,100,200,300,400")
+            sub.save_submission_file("query-3-trake", t_lines)
 
-            zip_p = sub.package_submission_zip("test.zip", query_ids=["q01", "qa01", "trake01"])
+            zip_p = sub.package_submission_zip("test_submission.zip", query_ids=["query-1-kis", "query-2-qa", "query-3-trake"])
             self.assertTrue(os.path.exists(zip_p))
+
+            # Test official submission zip validator
+            valid, errors = SubmissionGenerator.validate_submission_zip(zip_p)
+            self.assertTrue(valid, f"Validation failed with errors: {errors}")
+            self.assertEqual(len(errors), 0)
 
     def test_06_metrics_kis_trake_qa(self):
         # 1. KIS Metric Hit at rank 3

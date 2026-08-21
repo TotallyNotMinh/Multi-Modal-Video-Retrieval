@@ -1,9 +1,14 @@
 import os
+import sys
 import glob
 import json
 import numpy as np
 import fiftyone as fo
 import fiftyone.brain as fob
+
+# Ensure workspace root is in sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
 from src.index.matrix_builder import FeatureMatrixBuilder
 from src.index.object_indexer import ObjectIndexer
 
@@ -90,5 +95,9 @@ def launch_dashboard(dataset_name: str = "aic_2026_dataset", port: int = 5151):
     print(f"\n[FiftyOne] App is running at http://localhost:{port}")
     return session
 
+
 if __name__ == "__main__":
-    launch_dashboard()
+    session = launch_dashboard()
+    session.wait()
+
+
