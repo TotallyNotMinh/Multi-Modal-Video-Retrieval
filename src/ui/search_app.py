@@ -24,11 +24,15 @@ from src.query.translator import QueryTranslator
 
 # Vietnamese Stopwords & Common Noise Words to Filter
 VI_STOPWORDS = {
-    "là", "của", "và", "có", "trong", "được", "cho", "với", "các", "ở", "một", "này",
-    "đã", "để", "những", "khi", "ra", "đến", "về", "người", "như", "tại", "từ", "vào",
-    "lại", "đang", "theo", "nhiều", "sẽ", "đó", "thì", "làm", "rất", "năm", "sau",
-    "cũng", "ngày", "trên", "phải", "còn", "qua", "thể", "lên", "bị", "hơn", "đây",
-    "nhất", "hay", "mình", "cùng", "nhưng", "vừa", "thêm", "mẩu", "tin", "giới", "thiệu"
+    "là", "của", "và", "có", "trong", "được", "cho", "với", "các", "ở", "này",
+
+    "đã", "để", "những", "khi", "ra", "đến", "về", "như", "tại", "từ", "vào",
+
+    "lại", "đang", "theo", "sẽ", "đó", "thì", "sau",
+
+    "cũng", "trên", "còn", "qua", "lên", "bị", "hơn", "đây",
+
+    "nhất", "hay", "cùng", "nhưng", "vừa", "thêm"
 }
 
 
@@ -673,7 +677,7 @@ class SearchEngine:
                 "video_id": vid,
                 "frame_idx": f_idx,
                 "fps": fps,
-                "pts_time": round(pts, 2),
+                "pts_time": round(pts, 4),
                 "dense_score": round(float(dense_scores[idx]), 4),
                 "score": round(float(fused_scores[idx]), 4),
                 "matched_asr": keyframe_asr_texts.get(idx, ""),
@@ -839,13 +843,42 @@ class SearchEngine:
                 "video_id": vid,
                 "frame_idx": f_idx,
                 "fps": fps,
-                "pts_time": round(pts, 2),
-                "dense_score": round(float(dense_scores[idx]), 4),
+                "pts_time": round(pts, 4),
+                "dense_score": 1.0 if idx in pos_set else round(float(dense_scores[idx]), 4),
                 "score": score_val,
                 "matched_asr": keyframe_asr_texts.get(idx, ""),
                 "thumb_url": f"/api/frame?video_id={vid}&frame_idx={f_idx}",
                 "video_url": f"/api/video?video_id={vid}"
             })
+
+        # Explicitly ensure pinned items are placed at the absolute top (Rank 1)
+        pinned_items = [m for m in marked_items if m.get("isPinned")]
+        if pinned_items:
+            pinned_results = []
+            for p in pinned_items:
+                p_vid = p.get("video_id")
+                p_fid = int(p.get("frame_idx", 0))
+                p_pts = float(p.get("pts_time", 0.0))
+                p_fps = float(p.get("fps", 25.0))
+                # Remove any existing match to avoid duplicate
+                results = [r for r in results if not (r["video_id"] == p_vid and r["frame_idx"] == p_fid)]
+                pinned_results.append({
+                    "rank": 1,
+                    "video_id": p_vid,
+                    "frame_idx": p_fid,
+                    "fps": p_fps,
+                    "pts_time": round(p_pts, 2),
+                    "dense_score": 1.0,
+                    "score": 1.0,
+                    "matched_asr": "🎯 Pinned Match",
+                    "thumb_url": f"/api/frame?video_id={p_vid}&frame_idx={p_fid}",
+                    "video_url": f"/api/video?video_id={p_vid}",
+                    "is_pinned": True
+                })
+            results = pinned_results + results
+            results = results[:top_k]
+            for r_idx, r in enumerate(results, start=1):
+                r["rank"] = r_idx
 
         search_time_ms = round((time.time() - t0) * 1000, 1)
         return {
@@ -879,6 +912,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     };
   </script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script>if (typeof JSZip === 'undefined') { document.write('<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"><\/script>'); }</script>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
     body { font-family: 'Inter', sans-serif; }
@@ -897,21 +931,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         AI
       </div>
       <div>
-        <h1 class="font-bold text-base tracking-tight flex items-center gap-2">
+        <h1 class="font-bold text-base tracking-tight text-white">
           AIC 2026 Multi-Modal Retrieval Studio
-          <span class="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">BM25 + CLIP FUSION</span>
         </h1>
-        <p class="text-xs text-slate-400">177,321 Keyframes • 68,652 BM25 Speech Segments • Video Streaming</p>
       </div>
     </div>
 
     <div class="flex items-center gap-2.5">
-      <!-- Query Package Upload Button -->
+      <!-- Hidden File Input for Sidebar & Modal Uploads -->
       <input type="file" id="queryFileInput" accept=".zip,.txt,.json" multiple class="hidden" onchange="handleQueryFileUpload(event)" />
-      <button onclick="document.getElementById('queryFileInput').click()" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-300 border border-sky-500/30 transition flex items-center gap-1.5 shadow-sm" title="Tải lên gói câu hỏi (.zip chứa các file query-*.txt)">
-        <span>📂</span>
-        <span>Upload Queries (.zip)</span>
-      </button>
 
       <!-- Batch Export ZIP Button -->
       <button id="exportAllZipBtn" onclick="exportAllQueriesZip()" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-gradient-to-r from-amber-500/20 to-orange-500/20 hover:from-amber-500/30 hover:to-orange-500/30 text-amber-300 border border-amber-500/40 transition flex items-center gap-1.5 shadow-sm" title="Đóng gói toàn bộ đáp án của tất cả các câu truy vấn thành submission.zip">
@@ -942,33 +970,73 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="flex-1 w-full max-w-[1720px] mx-auto p-4 md:p-6 flex flex-col md:flex-row gap-6 items-start">
 
     <!-- Persistent Left Queries Sidebar (Always Visible) -->
-    <aside id="querySidebar" class="w-full md:w-80 lg:w-96 flex-shrink-0 glass rounded-2xl p-4 shadow-xl border border-slate-800 flex flex-col gap-3.5 md:sticky md:top-20 max-h-[calc(100vh-6rem)] overflow-hidden">
+    <aside id="querySidebar" class="w-full md:w-80 lg:w-[370px] flex-shrink-0 bg-[#080b14]/95 backdrop-blur-xl rounded-2xl p-4 shadow-2xl border border-slate-800/80 flex flex-col gap-3.5 md:sticky md:top-20 max-h-[calc(100vh-6rem)] overflow-hidden z-30 relative">
       
       <!-- Sidebar Header -->
-      <div class="flex items-center justify-between border-b border-slate-800 pb-3">
-        <div class="flex items-center gap-2">
-          <span class="text-base">📋</span>
-          <div>
-            <h2 class="font-bold text-xs tracking-tight text-white flex items-center gap-1.5">
-              Queries List
-              <span id="querySidebarCountBadge" class="px-2 py-0.5 rounded-full bg-sky-500/20 text-sky-300 border border-sky-500/30 text-[10px] font-mono font-bold">0 queries</span>
+      <div class="flex items-center justify-between border-b border-slate-800/70 pb-3">
+        <div class="flex items-center gap-3 min-w-0">
+          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white shadow-lg shadow-indigo-500/25 flex-shrink-0">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+            </svg>
+          </div>
+          <div class="min-w-0 flex-1">
+            <h2 class="font-extrabold text-sm tracking-tight text-white uppercase font-sans">
+              AIC 2026 STUDIO
             </h2>
-            <p id="querySidebarAnsweredText" class="text-[10px] text-slate-400">0 answered</p>
           </div>
         </div>
 
-        <div class="flex items-center gap-1.5">
-          <button onclick="document.getElementById('queryFileInput').click()" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-sky-300 border border-sky-500/30 rounded text-[11px] font-semibold transition" title="Tải thêm gói câu hỏi (.zip / .txt)">
-            ➕ Upload
+        <div class="flex items-center gap-1">
+          <button onclick="document.getElementById('queryFileInput').click()" class="p-1.5 bg-slate-900/80 hover:bg-slate-800 text-sky-400 border border-slate-800 rounded-lg text-xs transition" title="Upload Queries (.zip / .txt)">
+            ➕
           </button>
-          <button onclick="clearQueryPackageSession()" class="px-2 py-1 bg-slate-800 hover:bg-rose-900/40 text-rose-400 rounded text-[11px] transition" title="Xóa toàn bộ query">
-            🗑️
+          <button onclick="resetSessionStorage()" class="p-1.5 bg-slate-900/80 hover:bg-amber-950/50 text-amber-400 border border-slate-800 rounded-lg text-xs transition" title="Reset Session">
+            🧹
+          </button>
+        </div>
+      </div>
+
+      <!-- Filter Controls: Search Bar + Mode Tabs -->
+      <div class="flex flex-col gap-2.5">
+        <!-- Search Input -->
+        <div class="relative flex items-center">
+          <div class="absolute left-3 text-slate-500 pointer-events-none">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+            </svg>
+          </div>
+          <input 
+            id="sidebarFilterInput" 
+            type="text" 
+            placeholder="Filter queries..." 
+            class="w-full bg-[#0d1222] text-slate-200 placeholder-slate-500 text-xs rounded-xl pl-9 pr-8 py-2.5 border border-slate-800/80 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/40 transition font-medium"
+            oninput="filterSidebarQueries(this.value)"
+          />
+          <button id="sidebarFilterClearBtn" onclick="clearSidebarFilter()" class="hidden absolute right-2.5 text-slate-500 hover:text-slate-300 text-xs font-bold px-1">
+            ✕
+          </button>
+        </div>
+
+        <!-- Filter Tabs Row -->
+        <div class="flex items-center justify-between gap-1 text-xs">
+          <button id="filterTab_all" onclick="setSidebarModeFilter('all')" class="flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold bg-slate-800 text-white border border-slate-700 shadow-sm">
+            All (<span id="count_all">0</span>)
+          </button>
+          <button id="filterTab_kis" onclick="setSidebarModeFilter('kis')" class="flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-sky-400 hover:bg-slate-900/60">
+            KIS (<span id="count_kis">0</span>)
+          </button>
+          <button id="filterTab_qa" onclick="setSidebarModeFilter('qa')" class="flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-purple-400 hover:bg-slate-900/60">
+            QA (<span id="count_qa">0</span>)
+          </button>
+          <button id="filterTab_trake" onclick="setSidebarModeFilter('trake')" class="flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-amber-400 hover:bg-slate-900/60">
+            TRAKE (<span id="count_trake">0</span>)
           </button>
         </div>
       </div>
 
       <!-- Scrollable Query Cards List (Always Visible on Side) -->
-      <div id="queryCardsContainer" class="flex-1 overflow-y-auto flex flex-col gap-2 pr-1 min-h-[140px]">
+      <div id="queryCardsContainer" class="flex-1 overflow-y-auto flex flex-col gap-2.5 pr-1 min-h-[140px]">
         <!-- Empty State -->
         <div id="querySidebarEmptyState" class="py-12 text-center text-slate-500 text-xs flex flex-col items-center gap-2">
           <span class="text-3xl">📂</span>
@@ -980,11 +1048,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- Sidebar Bottom Action Buttons -->
-      <div class="border-t border-slate-800 pt-3 flex items-center justify-between gap-2">
+      <div class="border-t border-slate-800/80 pt-3 flex items-center justify-between gap-2">
         <button onclick="saveActiveQueryResult()" class="flex-1 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl transition flex items-center justify-center gap-1 shadow-md shadow-emerald-500/20">
           💾 Save Current
         </button>
-        <button onclick="exportAllQueriesZip()" class="flex-1 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl transition flex items-center justify-center gap-1 shadow-md shadow-amber-500/20">
+        <button onclick="exportAllQueriesZip()" class="flex-1 py-2 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-xs rounded-xl transition flex items-center justify-center gap-1 shadow-md shadow-amber-500/20">
           📦 Export ZIP
         </button>
       </div>
@@ -1038,9 +1106,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
           </button>
           <button onclick="cycleQuery(1)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition" title="Chuyển đến câu query tiếp theo">
             Next ⏭️
-          </button>
-          <button onclick="loadSampleQueries()" class="px-2.5 py-1 bg-sky-500/10 hover:bg-sky-500/20 text-sky-300 border border-sky-500/30 rounded-lg text-xs font-semibold transition" title="Nạp nhanh các câu hỏi mẫu để thử nghiệm">
-            ⚡ Sample Queries
           </button>
         </div>
       </div>
@@ -1133,7 +1198,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <!-- Results Status Bar & Feedback Controls -->
     <div class="flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400 px-1 bg-slate-900/60 p-3 rounded-xl border border-slate-800/80">
       <div class="flex items-center gap-3">
-        <div id="statusText">Ready for query. Press Enter to search.</div>
+        <div id="statusText"></div>
         <div id="timingBadge" class="hidden font-mono bg-slate-900 px-2.5 py-1 rounded border border-slate-800 text-emerald-400"></div>
       </div>
       <div class="flex items-center gap-2">
@@ -1150,14 +1215,34 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Video Filter & Display Toolbar -->
+    <div id="videoFilterBar" class="glass rounded-xl p-2.5 px-3.5 shadow-md flex flex-wrap items-center justify-between gap-3 border border-slate-800 text-xs">
+      <div class="flex items-center gap-2 flex-wrap">
+        <span class="text-slate-400 font-semibold flex items-center gap-1">
+          <span>🎬</span> Filter Video:
+        </span>
+        <select id="videoFilterSelect" onchange="onVideoFilterSelectChanged(this.value)" class="bg-slate-900 border border-slate-700 text-emerald-300 font-mono text-xs rounded-lg px-2.5 py-1 focus:outline-none focus:border-emerald-400">
+          <option value="">All Videos (No filter)</option>
+        </select>
+        <input id="videoFilterInput" type="text" placeholder="Search Video ID..." oninput="onVideoFilterInputChanged(this.value)" class="w-40 bg-slate-950 text-slate-200 placeholder-slate-600 rounded-lg px-2.5 py-1 border border-slate-800 focus:outline-none focus:border-emerald-500 font-mono text-xs" />
+        <button id="clearVideoFilterBtn" onclick="clearVideoFilter()" class="hidden px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] transition">
+          ✕ Clear Filter
+        </button>
+      </div>
+
+      <div class="flex items-center gap-2">
+        <span id="filteredCountBadge" class="text-[11px] text-slate-400 font-mono">Showing 0 / 0 keyframes</span>
+      </div>
+    </div>
+
     <!-- Gallery Grid -->
     <div id="resultsGrid" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4"></div>
 
   </main>
 </div>
 
-  <!-- Video Inspection Modal with Live Video Player -->
-  <div id="detailModal" class="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md hidden flex items-center justify-center p-4">
+  <!-- Video Inspection Modal (Non-blocking: Queries Sidebar stays visible on the left) -->
+  <div id="detailModal" class="fixed inset-0 z-40 bg-slate-950/75 backdrop-blur-sm hidden flex items-center justify-center md:pl-80 lg:pl-96 p-2 md:p-6 overflow-y-auto">
     <div class="glass max-w-4xl w-full rounded-2xl overflow-hidden shadow-2xl border border-slate-700 flex flex-col max-h-[92vh]">
       
       <!-- Modal Header -->
@@ -1211,18 +1296,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
 
         <!-- Metadata & Live Frame Tracker -->
-        <div class="grid grid-cols-3 gap-3 text-xs">
-          <div class="bg-slate-900 p-3 rounded-lg border border-slate-800">
-            <span class="text-slate-500 font-semibold block mb-0.5">VIDEO ID</span>
-            <span id="modalVideo" class="text-emerald-400 font-mono text-sm font-bold"></span>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
+          <div class="bg-slate-900 p-2.5 rounded-lg border border-slate-800">
+            <span class="text-slate-500 font-semibold block mb-0.5 text-[10px]">VIDEO ID</span>
+            <span id="modalVideo" class="text-emerald-400 font-mono text-xs font-bold truncate block"></span>
           </div>
-          <div class="bg-slate-900 p-3 rounded-lg border border-slate-800">
-            <span class="text-slate-500 font-semibold block mb-0.5">CANDIDATE FRAME</span>
-            <span id="modalCandidateFrame" class="text-slate-200 font-mono text-sm"></span>
+          <div class="bg-slate-900 p-2.5 rounded-lg border border-slate-800">
+            <span class="text-slate-500 font-semibold block mb-0.5 text-[10px]">CANDIDATE FRAME</span>
+            <span id="modalCandidateFrame" class="text-slate-200 font-mono text-xs truncate block"></span>
           </div>
-          <div class="bg-slate-900 p-3 rounded-lg border border-slate-800">
-            <span class="text-slate-500 font-semibold block mb-0.5">CURRENT PLAYING FRAME</span>
-            <span id="modalCurrentFrame" class="text-amber-300 font-mono text-sm font-bold">0 (00:00)</span>
+          <div class="bg-slate-900 p-2.5 rounded-lg border border-slate-800">
+            <span class="text-slate-500 font-semibold block mb-0.5 text-[10px]">PLAYING FRAME</span>
+            <span id="modalCurrentFrame" class="text-amber-300 font-mono text-xs font-bold block">0 (00:00)</span>
+          </div>
+          <div class="bg-slate-900 p-2.5 rounded-lg border border-slate-800">
+            <span class="text-slate-500 font-semibold block mb-0.5 text-[10px]">MATCH STATUS</span>
+            <span id="modalPinnedStatus" class="text-slate-400 font-mono text-xs block">Not Pinned</span>
           </div>
         </div>
 
@@ -1277,6 +1366,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <!-- Modal Footer -->
       <div class="p-4 border-t border-slate-800 bg-slate-900/60 flex flex-wrap items-center justify-between gap-3">
         <div class="flex flex-wrap items-center gap-2">
+          <!-- Standout Pin Current Frame Button -->
+          <button onclick="pinModalPlayingFrame()" class="px-3.5 py-2 bg-gradient-to-r from-amber-500 to-emerald-500 hover:from-amber-400 hover:to-emerald-400 text-slate-950 font-extrabold text-xs rounded-lg shadow-lg shadow-emerald-500/20 transition flex items-center gap-1.5" title="Chọn chính xác khung hình đang dừng/phát làm kết quả chính">
+            🎯 Pin Current Frame as Match
+          </button>
+          <!-- Neighbor Flood Button -->
+          <button onclick="floodNeighborsModal()" class="px-3 py-2 bg-gradient-to-r from-sky-600 to-teal-600 hover:from-sky-500 hover:to-teal-500 text-white font-bold text-xs rounded-lg shadow-md shadow-sky-500/20 transition flex items-center gap-1.5" title="Tự động điền 100 khung hình liền kề xung quanh frame này để tối đa hóa điểm R@k">
+            ⚡ Flood Top 100 Neighbors
+          </button>
           <button id="modalSaveTrakeFooterBtn" onclick="saveModalTrakeEvents(true)" class="px-3.5 py-2 bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white font-bold text-xs rounded-lg shadow-md shadow-indigo-500/30 transition flex items-center gap-1.5 hidden">
             💾 Save TRAKE & Close
           </button>
@@ -1292,8 +1389,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <button onclick="askVlmFromModalClip()" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-emerald-500/30 font-semibold text-xs rounded-lg transition flex items-center gap-1.5" title="Hỏi VLM về đoạn clip ngắn đã đánh dấu [Start, End]">
             🤖 Ask VLM About Clip
           </button>
-          <button onclick="markCurrentModalFrameAndRerank()" class="px-3.5 py-2 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-bold text-xs rounded-lg shadow-md shadow-emerald-500/20 transition flex items-center gap-1.5">
-            🎯 Mark Keyframe & Re-rank
+          <button onclick="markCurrentModalFrameAndRerank()" class="px-3 py-2 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 font-bold text-xs rounded-lg transition flex items-center gap-1.5">
+            🎯 Mark & Re-rank
           </button>
         </div>
         <button onclick="closeModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg transition">
@@ -1459,7 +1556,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </button>
       <button onclick="sendQuickPrompt('Liệt kê mốc thời gian chi tiết các sự kiện diễn ra trong video.')" class="px-2 py-1 bg-slate-800/80 hover:bg-slate-700 text-indigo-300 rounded-lg border border-indigo-500/20 transition truncate max-w-[195px]">
         ⏱️ Mốc thời gian
-      </button>
     </div>
 
     <!-- Chat Messages Scroll Area -->
@@ -1480,9 +1576,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <script>
+    function escapeHTML(str) {
+      if (str === null || str === undefined) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
     let currentResults = [];
     let currentModalItem = null;
-    let markedMap = new Map(); // Positive references: key -> { video_id, frame_idx, pts_time }
+    let markedMap = new Map(); // Positive references: key -> { video_id, frame_idx, pts_time, isPinned }
     let keywordsList = [];
     let nextKwId = 1;
     const videoElem = document.getElementById('mainVideoPlayer');
@@ -1495,6 +1601,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // Query Package Session State (plan.txt & rules.txt)
     let queryPackage = []; // Array of { id, filename, prompt, mode, status: 'unanswered'|'saved', savedData: {...} }
     let activeQueryId = 'query-1';
+
+    // Video Filter State
+    let activeVideoFilter = '';
 
     // Video Clip Range Tracking for VLM
     let videoClipRanges = {}; // vid -> { start_sec: float, end_sec: float }
@@ -1510,92 +1619,575 @@ HTML_PAGE = r"""<!DOCTYPE html>
       model: 'minimax/minimax-m3',
       apiKey: '',
       customUrl: '',
-      autoOpen: true
+      autoOpen: false // Fix: Disabled auto popup
     };
 
-    // --- Query Package Upload & Session Manager ---
+    // --- Session Persistence (localStorage) ---
+    const SESSION_STORAGE_KEY = 'aic_studio_session_v3';
+
+    function saveSessionToLocalStorage() {
+      try {
+        const payload = {
+          queryPackage: queryPackage,
+          activeQueryId: activeQueryId,
+          markedMap: Array.from(markedMap.entries()),
+          qaAnswersMap: qaAnswersMap,
+          trakeEventsMap: trakeEventsMap,
+          videoClipRanges: videoClipRanges,
+          currentTaskMode: currentTaskMode,
+          currentResults: currentResults.slice(0, 100)
+        };
+        localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(payload));
+      } catch (e) {
+        console.warn("Unable to save session to localStorage:", e);
+      }
+    }
+
+    function loadSessionFromLocalStorage() {
+      try {
+        const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+        if (!raw) return false;
+        const data = JSON.parse(raw);
+        if (!data || !data.queryPackage || data.queryPackage.length === 0) return false;
+
+        queryPackage = data.queryPackage || [];
+        activeQueryId = data.activeQueryId || (queryPackage[0] ? queryPackage[0].id : 'query-1');
+        markedMap = new Map(data.markedMap || []);
+        qaAnswersMap = data.qaAnswersMap || {};
+        trakeEventsMap = data.trakeEventsMap || {};
+        videoClipRanges = data.videoClipRanges || {};
+        currentTaskMode = data.currentTaskMode || 'kis';
+        currentResults = data.currentResults || [];
+
+        renderQueryNavigator();
+        selectQuery(activeQueryId, false);
+        if (currentResults.length > 0) {
+          populateVideoFilterDropdown(currentResults);
+          renderGrid(currentResults);
+          updateMarkedUI();
+        }
+        return true;
+      } catch (e) {
+        console.warn("Failed to restore session from localStorage:", e);
+        return false;
+      }
+    }
+
+    function resetSessionStorage() {
+      if (confirm("Bạn có chắc chắn muốn reset toàn bộ phiên làm việc (xóa toàn bộ câu hỏi và đáp án đã lưu)?")) {
+        try {
+          localStorage.removeItem(SESSION_STORAGE_KEY);
+        } catch (e) {}
+        queryPackage = [];
+        markedMap.clear();
+        qaAnswersMap = {};
+        trakeEventsMap = {};
+        currentResults = [];
+        activeVideoFilter = '';
+        renderQueryNavigator();
+        showQuickToast("🧹 Đã làm sạch toàn bộ phiên làm việc!");
+      }
+    }
+
+    function showQuickToast(msg) {
+      let toast = document.getElementById('quickToast');
+      if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'quickToast';
+        toast.className = 'fixed top-20 right-6 z-50 glass px-4 py-2.5 rounded-xl border border-emerald-500/40 text-emerald-300 text-xs font-bold shadow-2xl transition-all duration-300 transform translate-y-0 opacity-100 flex items-center gap-2';
+        document.body.appendChild(toast);
+      }
+      toast.innerHTML = msg;
+      toast.classList.remove('hidden');
+      toast.style.opacity = '1';
+      setTimeout(() => {
+        toast.style.opacity = '0';
+        setTimeout(() => toast.classList.add('hidden'), 300);
+      }, 2500);
+    }
+
+    // --- Video-Level Filtering ---
+    function populateVideoFilterDropdown(results) {
+      const select = document.getElementById('videoFilterSelect');
+      if (!select) return;
+      
+      const counts = {};
+      results.forEach(r => {
+        counts[r.video_id] = (counts[r.video_id] || 0) + 1;
+      });
+
+      const sortedVids = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+
+      let html = `<option value="">All Videos (${results.length} frames)</option>`;
+      sortedVids.forEach(v => {
+        html += `<option value="${v}">${v} (${counts[v]} frames)</option>`;
+      });
+      select.innerHTML = html;
+      select.value = activeVideoFilter;
+    }
+
+    function onVideoFilterSelectChanged(val) {
+      activeVideoFilter = (val || '').trim();
+      const input = document.getElementById('videoFilterInput');
+      if (input) input.value = activeVideoFilter;
+      applyVideoFilter();
+    }
+
+    function onVideoFilterInputChanged(val) {
+      activeVideoFilter = (val || '').trim();
+      const select = document.getElementById('videoFilterSelect');
+      if (select) select.value = select.querySelector(`option[value="${activeVideoFilter}"]`) ? activeVideoFilter : '';
+      applyVideoFilter();
+    }
+
+    function clearVideoFilter() {
+      activeVideoFilter = '';
+      const input = document.getElementById('videoFilterInput');
+      if (input) input.value = '';
+      const select = document.getElementById('videoFilterSelect');
+      if (select) select.value = '';
+      applyVideoFilter();
+    }
+
+    function isolateVideo(vid) {
+      activeVideoFilter = vid;
+      const input = document.getElementById('videoFilterInput');
+      if (input) input.value = vid;
+      const select = document.getElementById('videoFilterSelect');
+      if (select) select.value = vid;
+      applyVideoFilter();
+    }
+
+    function applyVideoFilter() {
+      const clearBtn = document.getElementById('clearVideoFilterBtn');
+      if (clearBtn) {
+        if (activeVideoFilter) clearBtn.classList.remove('hidden');
+        else clearBtn.classList.add('hidden');
+      }
+      renderGrid(currentResults);
+    }
+
+    // --- Neighbor Flooding Helper ---
+    function generateNeighborFrames(vid, centerFrame, total = 100, step = 1) {
+      const rows = [];
+      rows.push({ video_id: vid, frame_idx: centerFrame });
+      
+      let offset = 1;
+      while (rows.length < total) {
+        const fBefore = centerFrame - (offset * step);
+        const fAfter = centerFrame + (offset * step);
+        
+        if (fBefore >= 0 && rows.length < total) {
+          rows.push({ video_id: vid, frame_idx: fBefore });
+        }
+        if (rows.length < total) {
+          rows.push({ video_id: vid, frame_idx: fAfter });
+        }
+        offset++;
+      }
+      return rows;
+    }
+
+    // --- Shared CSV Output Builder ---
+    function buildCSVLinesForQuery(q) {
+      if (!q) return [];
+      const mode = q.mode || 'kis';
+      const saved = q.savedData || {};
+      const lines = [];
+
+      if (mode === 'kis') {
+        // Priority 1: Flooded neighbor frames
+        if (saved.floodFrames && saved.floodFrames.length > 0) {
+          saved.floodFrames.slice(0, 100).forEach(f => {
+            lines.push(`${f.video_id},${f.frame_idx}`);
+          });
+          return lines;
+        }
+
+        // Priority 2: Pinned frame as #1
+        if (saved.pinnedFrame) {
+          lines.push(`${saved.pinnedFrame.video_id},${saved.pinnedFrame.frame_idx}`);
+        }
+
+        // Priority 3: Marked positive items
+        if (saved.markedItems && saved.markedItems.length > 0) {
+          saved.markedItems.forEach(item => {
+            const row = `${item.video_id},${item.frame_idx}`;
+            if (!lines.includes(row) && lines.length < 100) {
+              lines.push(row);
+            }
+          });
+        }
+
+        // Priority 4: Fill remaining from search results
+        const resList = saved.results || (q.id === activeQueryId ? currentResults : []);
+        resList.forEach(r => {
+          const row = `${r.video_id},${r.frame_idx}`;
+          if (!lines.includes(row) && lines.length < 100) {
+            lines.push(row);
+          }
+        });
+      } else if (mode === 'qa') {
+        const ans = saved.qaAnswer !== undefined ? saved.qaAnswer : (Object.values(qaAnswersMap)[0] || '');
+        const ansField = formatCSVField(ans);
+
+        // Priority 1: Flooded neighbor frames
+        if (saved.floodFrames && saved.floodFrames.length > 0) {
+          saved.floodFrames.slice(0, 100).forEach(f => {
+            lines.push(`${f.video_id},${f.frame_idx},${ansField}`);
+          });
+          return lines;
+        }
+
+        // Priority 2: Pinned frame
+        if (saved.pinnedFrame) {
+          lines.push(`${saved.pinnedFrame.video_id},${saved.pinnedFrame.frame_idx},${ansField}`);
+        }
+
+        // Priority 3: Marked items
+        if (saved.markedItems && saved.markedItems.length > 0) {
+          saved.markedItems.forEach(item => {
+            const row = `${item.video_id},${item.frame_idx},${ansField}`;
+            if (!lines.some(l => l.startsWith(`${item.video_id},${item.frame_idx}`)) && lines.length < 100) {
+              lines.push(row);
+            }
+          });
+        }
+
+        // Priority 4: Search results
+        const resList = saved.results || (q.id === activeQueryId ? currentResults : []);
+        resList.forEach(r => {
+          const row = `${r.video_id},${r.frame_idx},${ansField}`;
+          if (!lines.some(l => l.startsWith(`${r.video_id},${r.frame_idx}`)) && lines.length < 100) {
+            lines.push(row);
+          }
+        });
+      } else if (mode === 'trake') {
+        if (saved.trakeEvents && saved.trakeEvents.length > 0) {
+          const vid = saved.trakeVideoId || (saved.markedItems && saved.markedItems[0] ? saved.markedItems[0].video_id : 'L21_V001');
+          const sortedFrames = saved.trakeEvents.map(e => e.frame_idx).sort((a, b) => a - b);
+          lines.push(`${vid},${sortedFrames.join(',')}`);
+        } else {
+          const resList = saved.results || (q.id === activeQueryId ? currentResults : []);
+          const targetVids = [];
+          if (saved.markedItems) {
+            saved.markedItems.forEach(v => { if (!targetVids.includes(v.video_id)) targetVids.push(v.video_id); });
+          }
+          resList.forEach(r => { if (!targetVids.includes(r.video_id)) targetVids.push(r.video_id); });
+
+          targetVids.forEach(vid => {
+            if (lines.length >= 100) return;
+            const events = (trakeEventsMap && trakeEventsMap[vid]) || [];
+            if (events.length > 0) {
+              const sortedFrames = events.map(e => e.frame_idx).sort((a, b) => a - b);
+              lines.push(`${vid},${sortedFrames.join(',')}`);
+            } else {
+              const kfs = resList.filter(r => r.video_id === vid).map(r => r.frame_idx).slice(0, 4);
+              if (kfs.length > 0) {
+                lines.push(`${vid},${kfs.join(',')}`);
+              }
+            }
+          });
+        }
+      }
+
+      // Fallback if completely empty
+      if (lines.length === 0) {
+        if (mode === 'kis') lines.push("L21_V001,0");
+        else if (mode === 'qa') lines.push("L21_V001,0,");
+        else if (mode === 'trake') lines.push("L21_V001,0,30,60,90");
+      }
+
+      return lines;
+    }
+
+    // --- Query Package Upload & Robust Multi-Format Parser ---
     function detectQueryMode(filename, promptText) {
       const fn = (filename || '').toLowerCase();
-      if (fn.includes('-qa') || fn.includes('_qa') || fn.endsWith('qa.txt') || fn.endsWith('qa.csv')) return 'qa';
-      if (fn.includes('-trake') || fn.includes('_trake') || fn.endsWith('trake.txt') || fn.endsWith('trake.csv')) return 'trake';
-      if (fn.includes('-kis') || fn.includes('_kis') || fn.endsWith('kis.txt') || fn.endsWith('kis.csv')) return 'kis';
+      const pt = (promptText || '').toLowerCase();
+      
+      if (fn.includes('-qa') || fn.includes('_qa') || fn.includes('/qa/') || fn.endsWith('qa.txt') || fn.endsWith('qa.csv') || fn.endsWith('qa.json')) return 'qa';
+      if (fn.includes('-trake') || fn.includes('_trake') || fn.includes('/trake/') || fn.endsWith('trake.txt') || fn.endsWith('trake.csv') || fn.endsWith('trake.json')) return 'trake';
+      if (fn.includes('-kis') || fn.includes('_kis') || fn.includes('/kis/') || fn.endsWith('kis.txt') || fn.endsWith('kis.csv') || fn.endsWith('kis.json')) return 'kis';
+      
+      if (pt.includes('hỏi đáp') || pt.includes('câu hỏi') || pt.includes('bao nhiêu') || pt.includes('ở đâu') || pt.includes('ai là') || pt.includes('màu gì') || pt.includes('biển số')) {
+        return 'qa';
+      }
+      if (pt.includes('chuỗi sự kiện') || pt.includes('mốc thời gian') || pt.includes('các phân cảnh từ lúc') || pt.includes('trake')) {
+        return 'trake';
+      }
       return 'kis';
     }
 
     function cleanQueryId(filename) {
-      const base = filename.split('/').pop().replace(/\.[^/.]+$/, "");
+      const parts = filename.replace(/\\/g, '/').split('/').filter(p => p && p !== '.' && !p.startsWith('__MACOSX'));
+      const base = parts.pop().replace(/\.[^/.]+$/, "");
+      
+      if (parts.length > 0) {
+        const parent = parts[parts.length - 1].toLowerCase();
+        if (['kis', 'qa', 'trake'].includes(parent) && !base.toLowerCase().includes(parent)) {
+          return `${parent}-${base}`.replace(/\s+/g, '_');
+        }
+      }
       return base.replace(/\s+/g, '_');
+    }
+
+    function parseAndAddQueries(filePath, rawContent, targetList) {
+      if (!rawContent || !rawContent.trim()) return;
+      const trimmed = rawContent.trim();
+      const fn = filePath.toLowerCase();
+
+      // Case 1: JSON file containing query definitions
+      if (fn.endsWith('.json')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed)) {
+            parsed.forEach((item, idx) => {
+              if (typeof item === 'string') {
+                const qid = `${cleanQueryId(filePath)}_${idx + 1}`;
+                targetList.push({
+                  id: qid,
+                  filename: `${qid}.txt`,
+                  prompt: item.trim(),
+                  mode: detectQueryMode(qid, item),
+                  status: 'unanswered',
+                  savedData: null
+                });
+              } else if (item && typeof item === 'object') {
+                const qid = (item.id || item.query_id || item.name || `${cleanQueryId(filePath)}_${idx + 1}`).toString().replace(/\s+/g, '_');
+                const prompt = (item.prompt || item.query || item.text || item.description || JSON.stringify(item)).trim();
+                const mode = item.mode || detectQueryMode(qid + ' ' + (item.type || ''), prompt);
+                targetList.push({
+                  id: qid,
+                  filename: `${qid}.txt`,
+                  prompt: prompt,
+                  mode: mode,
+                  status: 'unanswered',
+                  savedData: null
+                });
+              }
+            });
+            return;
+          } else if (typeof parsed === 'object' && parsed !== null) {
+            const arr = parsed.queries || parsed.data || parsed.items;
+            if (Array.isArray(arr)) {
+              arr.forEach((item, idx) => {
+                const qid = (item.id || item.query_id || item.name || `${cleanQueryId(filePath)}_${idx + 1}`).toString().replace(/\s+/g, '_');
+                const prompt = (item.prompt || item.query || item.text || item.description || JSON.stringify(item)).trim();
+                const mode = item.mode || detectQueryMode(qid, prompt);
+                targetList.push({
+                  id: qid,
+                  filename: `${qid}.txt`,
+                  prompt: prompt,
+                  mode: mode,
+                  status: 'unanswered',
+                  savedData: null
+                });
+              });
+              return;
+            } else {
+              const keys = Object.keys(parsed);
+              if (keys.length > 0) {
+                keys.forEach(k => {
+                  const val = parsed[k];
+                  const prompt = typeof val === 'string' ? val.trim() : (val.prompt || val.text || JSON.stringify(val));
+                  const mode = (typeof val === 'object' && val.mode) ? val.mode : detectQueryMode(k, prompt);
+                  targetList.push({
+                    id: k.replace(/\s+/g, '_'),
+                    filename: `${k}.txt`,
+                    prompt: prompt,
+                    mode: mode,
+                    status: 'unanswered',
+                    savedData: null
+                  });
+                });
+                return;
+              }
+            }
+          }
+        } catch (e) {}
+      }
+
+      // Case 2: Plain text / CSV files
+      const qid = cleanQueryId(filePath);
+      const mode = detectQueryMode(filePath, trimmed);
+
+      const existing = targetList.find(q => q.id === qid);
+      if (existing) {
+        existing.prompt = trimmed;
+        existing.mode = mode;
+      } else {
+        targetList.push({
+          id: qid,
+          filename: filePath.split('/').pop(),
+          prompt: trimmed,
+          mode: mode,
+          status: 'unanswered',
+          savedData: null
+        });
+      }
     }
 
     async function handleQueryFileUpload(event) {
       const files = event.target.files;
       if (!files || files.length === 0) return;
 
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        const name = file.name.toLowerCase();
+      showQuickToast("⏳ Đang giải nén và nạp gói câu hỏi...");
+      let loadedQueries = [];
 
-        if (name.endsWith('.zip')) {
-          try {
+      try {
+        for (let i = 0; i < files.length; i++) {
+          const file = files[i];
+          const name = file.name.toLowerCase();
+
+          if (name.endsWith('.zip')) {
+            if (typeof JSZip === 'undefined') {
+              throw new Error("Thư viện JSZip chưa sẵn sàng. Vui lòng kiểm tra kết nối mạng.");
+            }
             const zip = await JSZip.loadAsync(file);
             const entries = [];
+            
             zip.forEach((relPath, zipEntry) => {
-              if (!zipEntry.dir && !relPath.startsWith('__MACOSX') && !relPath.endsWith('.DS_Store')) {
-                entries.push(zipEntry);
+              const basename = relPath.split('/').pop();
+              if (!zipEntry.dir && !relPath.includes('__MACOSX') && !basename.startsWith('.') && !relPath.endsWith('.DS_Store')) {
+                entries.push({ relPath, zipEntry });
               }
             });
 
-            // Sort entries naturally (e.g. query-1, query-2, etc.)
-            entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+            // Natural sort entries by query path/name
+            entries.sort((a, b) => a.relPath.localeCompare(b.relPath, undefined, { numeric: true, sensitivity: 'base' }));
 
-            for (const entry of entries) {
-              const text = await entry.async('string');
-              addQueryToSession(entry.name, text);
+            for (const item of entries) {
+              const text = await item.zipEntry.async('string');
+              parseAndAddQueries(item.relPath, text, loadedQueries);
             }
-          } catch (err) {
-            alert("Lỗi giải nén file ZIP: " + err.message);
+          } else if (name.endsWith('.txt') || name.endsWith('.json') || name.endsWith('.csv')) {
+            const text = await file.text();
+            parseAndAddQueries(file.name, text, loadedQueries);
           }
-        } else if (name.endsWith('.txt') || name.endsWith('.json')) {
-          const text = await file.text();
-          addQueryToSession(file.name, text);
         }
-      }
 
-      event.target.value = '';
-      renderQueryNavigator();
-      if (queryPackage.length > 0) {
-        selectQuery(queryPackage[0].id);
+        if (loadedQueries.length > 0) {
+          // Replace current query package with loaded package
+          queryPackage = loadedQueries;
+          activeQueryId = queryPackage[0].id;
+          
+          // Reset sidebar filters to 'all' so all loaded queries are visible
+          sidebarModeFilter = 'all';
+          sidebarSearchText = '';
+          const filterInput = document.getElementById('sidebarFilterInput');
+          if (filterInput) filterInput.value = '';
+          const clearBtn = document.getElementById('sidebarFilterClearBtn');
+          if (clearBtn) clearBtn.classList.add('hidden');
+          
+          // Update mode filter tabs UI
+          ['all', 'kis', 'qa', 'trake'].forEach(t => {
+            const btn = document.getElementById(`filterTab_${t}`);
+            if (!btn) return;
+            if (t === 'all') {
+              btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold bg-slate-800 text-white border border-slate-700 shadow-sm';
+            } else if (t === 'kis') {
+              btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-sky-400 hover:bg-slate-900/60';
+            } else if (t === 'qa') {
+              btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-purple-400 hover:bg-slate-900/60';
+            } else if (t === 'trake') {
+              btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-amber-400 hover:bg-slate-900/60';
+            }
+          });
+
+          renderQueryNavigator();
+          saveSessionToLocalStorage();
+          selectQuery(activeQueryId, false); // Don't trigger heavy search blocking
+          showQuickToast(`✅ Đã nạp thành công ${loadedQueries.length} câu truy vấn!`);
+        } else {
+          alert("Không tìm thấy file câu hỏi hợp lệ trong tệp đã chọn.");
+        }
+      } catch (err) {
+        console.error("Lỗi khi tải gói câu hỏi:", err);
+        alert("Lỗi tải gói câu hỏi: " + err.message);
+      } finally {
+        event.target.value = '';
       }
     }
 
     function addQueryToSession(filename, rawText) {
-      const qid = cleanQueryId(filename);
-      const cleanPrompt = rawText.trim();
-      const mode = detectQueryMode(filename, cleanPrompt);
+      parseAndAddQueries(filename, rawText, queryPackage);
+      saveSessionToLocalStorage();
+    }
 
-      const existingIdx = queryPackage.findIndex(q => q.id === qid);
-      const queryObj = {
-        id: qid,
-        filename: filename,
-        prompt: cleanPrompt,
-        mode: mode,
-        status: 'unanswered',
-        savedData: null
-      };
+    let sidebarModeFilter = 'all';
+    let sidebarSearchText = '';
 
-      if (existingIdx >= 0) {
-        queryPackage[existingIdx] = queryObj;
-      } else {
-        queryPackage.push(queryObj);
+    function setSidebarModeFilter(mode) {
+      sidebarModeFilter = mode;
+      
+      const tabs = ['all', 'kis', 'qa', 'trake'];
+      tabs.forEach(t => {
+        const btn = document.getElementById(`filterTab_${t}`);
+        if (!btn) return;
+        if (t === mode) {
+          if (t === 'all') {
+            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold bg-slate-800 text-white border border-slate-700 shadow-sm';
+          } else if (t === 'kis') {
+            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold bg-sky-500/20 text-sky-300 border border-sky-500/40 shadow-sm';
+          } else if (t === 'qa') {
+            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold bg-purple-500/20 text-purple-300 border border-purple-500/40 shadow-sm';
+          } else if (t === 'trake') {
+            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm';
+          }
+        } else {
+          if (t === 'all') {
+            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-slate-400 hover:bg-slate-900/60';
+          } else if (t === 'kis') {
+            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-sky-400 hover:bg-slate-900/60';
+          } else if (t === 'qa') {
+            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-purple-400 hover:bg-slate-900/60';
+          } else if (t === 'trake') {
+            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-amber-400 hover:bg-slate-900/60';
+          }
+        }
+      });
+
+      renderQueryNavigator();
+    }
+
+    function filterSidebarQueries(val) {
+      sidebarSearchText = (val || '').toLowerCase().trim();
+      const clearBtn = document.getElementById('sidebarFilterClearBtn');
+      if (clearBtn) {
+        if (sidebarSearchText) {
+          clearBtn.classList.remove('hidden');
+        } else {
+          clearBtn.classList.add('hidden');
+        }
       }
+      renderQueryNavigator();
+    }
+
+    function clearSidebarFilter() {
+      const input = document.getElementById('sidebarFilterInput');
+      if (input) input.value = '';
+      filterSidebarQueries('');
     }
 
     function renderQueryNavigator() {
       const container = document.getElementById('queryCardsContainer');
-      const countBadge = document.getElementById('querySidebarCountBadge');
-      const answeredText = document.getElementById('querySidebarAnsweredText');
-
       if (!container) return;
+
+      const countAllEl = document.getElementById('count_all');
+      const countKisEl = document.getElementById('count_kis');
+      const countQaEl = document.getElementById('count_qa');
+      const countTrakeEl = document.getElementById('count_trake');
+
+      const totalAll = queryPackage.length;
+      const countKis = queryPackage.filter(q => q.mode === 'kis').length;
+      const countQa = queryPackage.filter(q => q.mode === 'qa').length;
+      const countTrake = queryPackage.filter(q => q.mode === 'trake').length;
+
+      if (countAllEl) countAllEl.innerText = totalAll;
+      if (countKisEl) countKisEl.innerText = countKis;
+      if (countQaEl) countQaEl.innerText = countQa;
+      if (countTrakeEl) countTrakeEl.innerText = countTrake;
 
       if (!queryPackage || queryPackage.length === 0) {
         container.innerHTML = `
@@ -1607,86 +2199,131 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </button>
           </div>
         `;
-        if (countBadge) countBadge.innerText = '0 queries';
-        if (answeredText) answeredText.innerText = '0 answered';
+        updateBatchProgress();
+        return;
+      }
+
+      // Filter items by mode & search text
+      let filtered = queryPackage;
+      if (sidebarModeFilter !== 'all') {
+        filtered = filtered.filter(q => q.mode === sidebarModeFilter);
+      }
+      if (sidebarSearchText) {
+        filtered = filtered.filter(q => {
+          const idMatch = (q.id || '').toLowerCase().includes(sidebarSearchText);
+          const promptMatch = (q.prompt || '').toLowerCase().includes(sidebarSearchText);
+          return idMatch || promptMatch;
+        });
+      }
+
+      if (filtered.length === 0) {
+        container.innerHTML = `
+          <div class="py-8 text-center text-slate-500 text-xs flex flex-col items-center gap-1.5">
+            <span>🔍 Không tìm thấy query phù hợp</span>
+            <button onclick="clearSidebarFilter(); setSidebarModeFilter('all');" class="text-indigo-400 hover:underline text-[11px]">
+              Xóa bộ lọc
+            </button>
+          </div>
+        `;
         updateBatchProgress();
         return;
       }
 
       container.innerHTML = '';
-      const answeredCount = queryPackage.filter(q => q.status === 'saved').length;
-      if (countBadge) countBadge.innerText = `${queryPackage.length} queries`;
-      if (answeredText) answeredText.innerText = `${answeredCount} / ${queryPackage.length} answered`;
 
-      queryPackage.forEach((q, idx) => {
-        const isSelected = q.id === activeQueryId;
-        const isSaved = q.status === 'saved';
+      filtered.forEach((q) => {
+        try {
+          const isSelected = q.id === activeQueryId;
+          const isSaved = q.status === 'saved' || (q.savedData && (
+            (q.savedData.markedItems && q.savedData.markedItems.length > 0) || 
+            q.savedData.qaAnswer || 
+            (q.savedData.trakeEvents && q.savedData.trakeEvents.length > 0) || 
+            q.savedData.pinnedFrame || 
+            q.savedData.floodFrames
+          ));
 
-        let modeBadge = '';
-        let modeColor = '';
-        if (q.mode === 'kis') {
-          modeBadge = '🔍 KIS';
-          modeColor = 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40';
-        } else if (q.mode === 'qa') {
-          modeBadge = '💬 Q&A';
-          modeColor = 'bg-amber-500/20 text-amber-300 border-amber-500/40';
-        } else if (q.mode === 'trake') {
-          modeBadge = '⏱️ TRAKE';
-          modeColor = 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40';
-        }
+          let modeBadge = 'KIS';
+          let modeColor = 'bg-sky-950/90 text-sky-400 border border-sky-800/40';
+          let rowCountText = '100 rows';
 
-        let savedSummary = '';
-        if (isSaved && q.savedData) {
-          if (q.mode === 'kis') {
-            const mCount = q.savedData.markedItems ? q.savedData.markedItems.length : 0;
-            savedSummary = `✓ ${mCount} marked + Top 100`;
-          } else if (q.mode === 'qa') {
-            savedSummary = `💬 "${q.savedData.qaAnswer || ''}"`;
+          if (q.mode === 'qa') {
+            modeBadge = 'QA';
+            modeColor = 'bg-purple-950/90 text-purple-300 border border-purple-800/40';
+            rowCountText = '100 rows';
           } else if (q.mode === 'trake') {
-            const evCount = q.savedData.trakeEvents ? q.savedData.trakeEvents.length : 0;
-            savedSummary = `⏱️ ${evCount} events [${(q.savedData.trakeEvents || []).map(e => 'F' + e.frame_idx).join(', ')}]`;
+            modeBadge = 'TRAKE';
+            modeColor = 'bg-amber-950/90 text-amber-300 border border-amber-800/40';
+            rowCountText = '20 rows';
           }
+
+          let savedSummary = '';
+          if (isSaved && q.savedData) {
+            if (q.savedData.floodFrames) {
+              rowCountText = '100 rows';
+              savedSummary = `⚡ 100 Neighbors (${q.savedData.floodVideoId || ''} F${q.savedData.floodCenter || 0})`;
+            } else if (q.savedData.pinnedFrame) {
+              rowCountText = '1 row';
+              savedSummary = `🎯 Pinned: ${q.savedData.pinnedFrame.video_id} F${q.savedData.pinnedFrame.frame_idx}`;
+            } else if (q.mode === 'kis') {
+              const mCount = q.savedData.markedItems ? q.savedData.markedItems.length : 0;
+              savedSummary = `✓ ${mCount > 0 ? `${mCount} marked + ` : ''}Top 100 frames`;
+            } else if (q.mode === 'qa') {
+              savedSummary = `💬 "${escapeHTML(q.savedData.qaAnswer || '')}"`;
+            } else if (q.mode === 'trake') {
+              const evCount = q.savedData.trakeEvents ? q.savedData.trakeEvents.length : 0;
+              rowCountText = `${evCount > 0 ? evCount : 20} rows`;
+              savedSummary = `⏱️ ${evCount} events`;
+            }
+          }
+
+          const card = document.createElement('div');
+          card.className = `p-3 rounded-xl border transition-all cursor-pointer flex flex-col gap-1.5 ${
+            isSelected 
+              ? 'bg-[#13162b] border-indigo-500 ring-2 ring-indigo-500/40 shadow-lg shadow-indigo-500/10' 
+              : 'bg-[#0b0f19]/90 border-slate-800/80 hover:border-slate-700 hover:bg-slate-900/60'
+          }`;
+          card.onclick = () => selectQuery(q.id);
+
+          const safeId = escapeHTML(q.id || 'query');
+          const safePrompt = escapeHTML(q.prompt || '');
+
+          card.innerHTML = `
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-1.5 min-w-0">
+                <span class="text-[10px] px-1.5 py-0.5 rounded font-mono font-bold ${modeColor}">${modeBadge}</span>
+                <span class="font-mono font-bold text-xs truncate ${isSelected ? 'text-white' : 'text-slate-200'}">${safeId}</span>
+              </div>
+              <div class="flex items-center gap-1.5 flex-shrink-0">
+                ${isSaved ? `
+                  <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-semibold flex items-center gap-0.5">
+                    ✓ Saved
+                  </span>
+                ` : `
+                  <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-slate-800 text-slate-400 font-medium">
+                    ○ Pending
+                  </span>
+                `}
+                <span class="text-[10px] font-mono text-emerald-400/90 font-medium">${rowCountText}</span>
+              </div>
+            </div>
+
+            <p class="text-[11px] text-slate-400 line-clamp-2 leading-relaxed font-sans mt-0.5">
+              ${safePrompt || '<i class="text-slate-600">(Trống - click để tìm kiếm)</i>'}
+            </p>
+
+            ${savedSummary ? `
+              <div class="text-[10px] text-emerald-400/90 font-mono bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-800/40 truncate mt-0.5">
+                ${savedSummary}
+              </div>
+            ` : ''}
+          `;
+          container.appendChild(card);
+        } catch (e) {
+          console.error("Lỗi khi render query card:", q, e);
         }
-
-        const card = document.createElement('div');
-        card.className = `p-3 rounded-xl border transition-all cursor-pointer flex flex-col gap-1.5 ${
-          isSelected 
-            ? 'bg-slate-900 border-emerald-400 ring-2 ring-emerald-500/30 shadow-lg shadow-emerald-500/10' 
-            : 'bg-slate-950/70 border-slate-800/90 hover:border-slate-700'
-        }`;
-        card.onclick = () => selectQuery(q.id);
-
-        card.innerHTML = `
-          <div class="flex items-center justify-between">
-            <div class="flex items-center gap-1.5">
-              <span class="text-[10px] px-1.5 py-0.5 rounded font-mono font-bold border ${modeColor}">${modeBadge}</span>
-              <span class="font-mono font-bold text-xs ${isSelected ? 'text-white' : 'text-slate-200'}">${q.id}</span>
-            </div>
-            ${isSaved ? `
-              <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-semibold flex items-center gap-1">
-                ✓ Saved
-              </span>
-            ` : `
-              <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-slate-800 text-slate-400 font-semibold">
-                ○ Unanswered
-              </span>
-            `}
-          </div>
-
-          <p class="text-[11px] text-slate-400 line-clamp-2 leading-relaxed font-sans">
-            ${escapeHTML(q.prompt) || '<i class="text-slate-600">(Trống - click để tìm kiếm)</i>'}
-          </p>
-
-          ${savedSummary ? `
-            <div class="text-[10px] text-emerald-400/90 font-mono bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-800/40 truncate">
-              ${savedSummary}
-            </div>
-          ` : ''}
-        `;
-        container.appendChild(card);
       });
 
-      // Sync Quick Query Dropdown Selector in Search Card
+      // Sync Quick Query Dropdown Selector
       const quickSelect = document.getElementById('quickQuerySelector');
       if (quickSelect) {
         quickSelect.innerHTML = '';
@@ -1772,6 +2409,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
 
         currentResults = query.savedData.results || [];
+        populateVideoFilterDropdown(currentResults);
         renderGrid(currentResults);
         updateMarkedUI();
       } else {
@@ -1782,54 +2420,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
 
       renderQueryNavigator();
+      saveSessionToLocalStorage();
     }
 
     function cycleQuery(direction) {
       if (!queryPackage || queryPackage.length === 0) return;
       const currentIdx = queryPackage.findIndex(q => q.id === activeQueryId);
       const nextIdx = (currentIdx + direction + queryPackage.length) % queryPackage.length;
-      selectQuery(queryPackage[nextIdx].id, true);
-    }
-
-    function loadSampleQueries() {
-      const sampleList = [
-        {
-          id: "query-1-kis",
-          filename: "query-1-kis.txt",
-          prompt: "Mẩu tin giới thiệu về đàn hổ tại một địa phương ở miền Nam vừa có thêm 3-6 con hổ con",
-          mode: "kis"
-        },
-        {
-          id: "query-2-kis",
-          filename: "query-2-kis.txt",
-          prompt: "Người phụ nữ mặc áo dài đỏ đang phát biểu tại hội nghị xúc tiến đầu tư",
-          mode: "kis"
-        },
-        {
-          id: "query-3-qa",
-          filename: "query-3-qa.txt",
-          prompt: "Có bao nhiêu người đang ngồi quanh bàn họp trong phòng?",
-          mode: "qa"
-        },
-        {
-          id: "query-4-trake",
-          filename: "query-4-trake.txt",
-          prompt: "Chuỗi sự kiện đoàn người diễu hành, dừng lại trước sân khấu, cắt băng khánh thành và thả bóng bay",
-          mode: "trake"
-        }
-      ];
-
-      sampleList.forEach(s => addQueryToSession(s.filename, s.prompt));
-      renderQueryNavigator();
-      if (queryPackage.length > 0) {
-        selectQuery(queryPackage[0].id, true);
-      }
+      selectQuery(queryPackage[nextIdx].id, false);
     }
 
     function clearQueryPackageSession() {
       if (confirm("Bạn có chắc chắn muốn xóa toàn bộ gói câu hỏi đã tải lên không?")) {
         queryPackage = [];
         renderQueryNavigator();
+        saveSessionToLocalStorage();
       }
     }
 
@@ -1854,33 +2459,36 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const qaAns = firstVid ? (qaAnswersMap[firstVid] || '') : (Object.values(qaAnswersMap)[0] || '');
       const trakeEvs = firstVid ? (trakeEventsMap[firstVid] || []) : (Object.values(trakeEventsMap)[0] || []);
 
-      query.savedData = {
-        mode: currentTaskMode,
-        markedItems: marked_items,
-        qaAnswer: qaAns,
-        qaVideoId: firstVid,
-        trakeEvents: trakeEvs,
-        trakeVideoId: firstVid,
-        results: currentResults
-      };
+      if (!query.savedData) query.savedData = {};
+      query.savedData.mode = currentTaskMode;
+      query.savedData.markedItems = marked_items;
+      query.savedData.qaAnswer = qaAns;
+      query.savedData.qaVideoId = firstVid;
+      query.savedData.trakeEvents = trakeEvs;
+      query.savedData.trakeVideoId = firstVid;
+      query.savedData.results = currentResults;
       query.status = 'saved';
 
       renderQueryNavigator();
+      saveSessionToLocalStorage();
 
       let desc = '';
-      if (currentTaskMode === 'kis') {
+      if (query.savedData.floodFrames) {
+        desc = `100 neighbor frames around Frame ${query.savedData.floodCenter}`;
+      } else if (query.savedData.pinnedFrame) {
+        desc = `pinned Frame ${query.savedData.pinnedFrame.frame_idx} (${query.savedData.pinnedFrame.video_id})`;
+      } else if (currentTaskMode === 'kis') {
         desc = `${marked_items.length} marked keyframes + top 100 results`;
       } else if (currentTaskMode === 'qa') {
         desc = `answer "${qaAns}"`;
       } else if (currentTaskMode === 'trake') {
         desc = `${trakeEvs.length} event marks`;
       }
-      alert(`✅ Đã lưu kết quả cho [${qid}] (${desc})!`);
+      showQuickToast(`✅ Đã lưu kết quả cho [${qid}] (${desc})!`);
     }
 
     async function exportAllQueriesZip() {
       if (!queryPackage || queryPackage.length === 0) {
-        // If no package uploaded, save current query and export single in zip
         const qid = (document.getElementById('queryIdInput').value || 'query-1').trim();
         saveActiveQueryResult();
       }
@@ -1889,57 +2497,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const subFolder = zip.folder("submission");
 
       queryPackage.forEach(q => {
-        let lines = [];
-        const mode = q.mode;
-
-        if (mode === 'kis') {
-          if (q.savedData && q.savedData.markedItems && q.savedData.markedItems.length > 0) {
-            q.savedData.markedItems.forEach(item => {
-              lines.push(`${item.video_id},${item.frame_idx}`);
-            });
-          }
-          if (q.savedData && q.savedData.results) {
-            q.savedData.results.forEach(r => {
-              const rowStr = `${r.video_id},${r.frame_idx}`;
-              if (!lines.includes(rowStr) && lines.length < 100) {
-                lines.push(rowStr);
-              }
-            });
-          }
-        } else if (mode === 'qa') {
-          const ans = q.savedData ? q.savedData.qaAnswer : '';
-          if (q.savedData && q.savedData.markedItems && q.savedData.markedItems.length > 0) {
-            q.savedData.markedItems.forEach(item => {
-              lines.push(`${item.video_id},${item.frame_idx},${formatCSVField(ans)}`);
-            });
-          }
-          if (q.savedData && q.savedData.results) {
-            q.savedData.results.forEach(r => {
-              const rowStr = `${r.video_id},${r.frame_idx},${formatCSVField(ans)}`;
-              if (!lines.some(l => l.startsWith(`${r.video_id},${r.frame_idx}`)) && lines.length < 100) {
-                lines.push(rowStr);
-              }
-            });
-          }
-        } else if (mode === 'trake') {
-          if (q.savedData && q.savedData.trakeEvents && q.savedData.trakeEvents.length > 0) {
-            const vid = q.savedData.trakeVideoId || (q.savedData.markedItems && q.savedData.markedItems[0] ? q.savedData.markedItems[0].video_id : 'L21_V001');
-            const sortedFrames = q.savedData.trakeEvents.map(e => e.frame_idx).sort((a, b) => a - b);
-            lines.push(`${vid},${sortedFrames.join(',')}`);
-          } else if (q.savedData && q.savedData.results && q.savedData.results.length > 0) {
-            const vid = q.savedData.results[0].video_id;
-            const kfs = q.savedData.results.filter(r => r.video_id === vid).map(r => r.frame_idx).slice(0, 4);
-            lines.push(`${vid},${kfs.join(',')}`);
-          }
-        }
-
-        // Fallback default row if completely unanswered
-        if (lines.length === 0) {
-          if (mode === 'kis') lines.push("L21_V001,0");
-          else if (mode === 'qa') lines.push("L21_V001,0,");
-          else if (mode === 'trake') lines.push("L21_V001,0,30,60,90");
-        }
-
+        const lines = buildCSVLinesForQuery(q);
         const csvContent = lines.join(String.fromCharCode(10)) + String.fromCharCode(10);
         subFolder.file(`${q.id}.csv`, csvContent);
       });
@@ -2215,6 +2773,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         pts_time: pts
       });
       updateMarkedUI();
+      saveActiveQueryResult();
 
       renderTrakeEventsModal(vid);
       renderGrid(currentResults);
@@ -2223,6 +2782,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function removeTrakeEvent(vid, fid) {
       if (!trakeEventsMap[vid]) return;
       trakeEventsMap[vid] = trakeEventsMap[vid].filter(e => e.frame_idx !== fid);
+      saveActiveQueryResult();
       renderTrakeEventsModal(vid);
       renderGrid(currentResults);
     }
@@ -2894,28 +3454,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     // --- Correct Marks Management ---
+    // --- Correct Marks Management ---
     function toggleMark(vid, fid, pts, event) {
       if (event) event.stopPropagation();
       const key = `${vid}_${fid}`;
-      let newlyMarked = false;
       if (markedMap.has(key)) {
         markedMap.delete(key);
       } else {
-        markedMap.set(key, { video_id: vid, frame_idx: fid, pts_time: pts });
-        newlyMarked = true;
+        markedMap.set(key, { video_id: vid, frame_idx: fid, pts_time: pts, isPinned: false });
       }
       updateMarkedUI();
       renderGrid(currentResults);
-
-      if (newlyMarked) {
-        openChatbotForVideo(vid, fid, pts);
-      }
+      saveSessionToLocalStorage();
     }
 
     function clearMarks() {
       markedMap.clear();
       updateMarkedUI();
       renderGrid(currentResults);
+      saveSessionToLocalStorage();
     }
 
     function updateMarkedUI() {
@@ -2949,7 +3506,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const q = document.getElementById('queryInput').value.trim();
       if (!q) return;
 
-      // Auto-clear marks on new search
       markedMap.clear();
       updateMarkedUI();
 
@@ -2969,14 +3525,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         currentResults = data.results || [];
 
         document.getElementById('transQuery').innerText = data.translated_query || 'N/A';
-        document.getElementById('statusText').innerText = `Displaying top ${currentResults.length} matches for "${q}"`;
+        document.getElementById('statusText').innerText = '';
         
         const badge = document.getElementById('timingBadge');
         badge.classList.remove('hidden');
         badge.innerText = `⚡ ${data.search_time_ms} ms`;
 
+        populateVideoFilterDropdown(currentResults);
         renderGrid(currentResults);
         updateMarkedUI();
+        saveSessionToLocalStorage();
       } catch (err) {
         document.getElementById('statusText').innerText = `❌ Error: ${err.message}`;
       }
@@ -3010,14 +3568,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         currentResults = data.results || [];
 
         document.getElementById('transQuery').innerText = data.translated_query || 'N/A';
-        document.getElementById('statusText').innerText = `Re-ranked top ${currentResults.length} matches with ${marked_items.length} marked references`;
+        document.getElementById('statusText').innerText = '';
         
         const badge = document.getElementById('timingBadge');
         badge.classList.remove('hidden');
         badge.innerText = `⚡ ${data.search_time_ms} ms`;
 
+        populateVideoFilterDropdown(currentResults);
         renderGrid(currentResults);
         updateMarkedUI();
+        saveSessionToLocalStorage();
       } catch (err) {
         document.getElementById('statusText').innerText = `❌ Error: ${err.message}`;
       }
@@ -3027,20 +3587,37 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const grid = document.getElementById('resultsGrid');
       grid.innerHTML = '';
 
-      if (!items || items.length === 0) {
-        grid.innerHTML = `<div class="col-span-full py-16 text-center text-slate-500">No matching keyframes found.</div>`;
+      let displayItems = items || [];
+      if (activeVideoFilter) {
+        displayItems = displayItems.filter(item => item.video_id.toLowerCase().includes(activeVideoFilter.toLowerCase()));
+      }
+
+      const countBadge = document.getElementById('filteredCountBadge');
+      if (countBadge) {
+        countBadge.innerText = `Showing ${displayItems.length} / ${(items || []).length} keyframes`;
+      }
+
+      if (!displayItems || displayItems.length === 0) {
+        grid.innerHTML = `<div class="col-span-full py-16 text-center text-slate-500">No matching keyframes found${activeVideoFilter ? ` for video filter "${activeVideoFilter}"` : ''}.</div>`;
         return;
       }
 
-      items.forEach((item, idx) => {
+      const activeQ = queryPackage.find(q => q.id === activeQueryId);
+      const pinnedInfo = activeQ && activeQ.savedData && activeQ.savedData.pinnedFrame;
+
+      displayItems.forEach((item) => {
+        const origIdx = items.indexOf(item);
         const key = `${item.video_id}_${item.frame_idx}`;
         const isMarked = markedMap.has(key);
+        const isPinned = (pinnedInfo && pinnedInfo.video_id === item.video_id && pinnedInfo.frame_idx === item.frame_idx) || (markedMap.get(key) && markedMap.get(key).isPinned);
         const vid = item.video_id;
 
         const card = document.createElement('div');
-        const borderClass = isMarked 
-          ? 'border-2 border-emerald-400 ring-2 ring-emerald-500/30 shadow-emerald-500/20' 
-          : 'hover:border-emerald-500/50 hover:shadow-emerald-500/10';
+        const borderClass = isPinned
+          ? 'border-2 border-amber-400 ring-2 ring-amber-500/40 shadow-amber-500/20'
+          : (isMarked 
+              ? 'border-2 border-emerald-400 ring-2 ring-emerald-500/30 shadow-emerald-500/20' 
+              : 'hover:border-emerald-500/50 hover:shadow-emerald-500/10');
 
         card.className = `glass rounded-xl overflow-hidden shadow-lg ${borderClass} transition-all duration-200 flex flex-col group`;
 
@@ -3051,7 +3628,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const trakeEvents = trakeEventsMap[vid] || [];
 
         card.innerHTML = `
-          <div class="relative aspect-video bg-slate-900 overflow-hidden cursor-pointer" onclick="openModal(${idx})">
+          <div class="relative aspect-video bg-slate-900 overflow-hidden cursor-pointer" onclick="openModal(${origIdx >= 0 ? origIdx : 0})">
             <img src="${item.thumb_url}" loading="lazy" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" onerror="this.src='https://via.placeholder.com/480x270/0f172a/64748b?text=Frame+Preview'" />
             
             <div class="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
@@ -3060,14 +3637,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
               </div>
             </div>
 
-            <div class="absolute top-2 left-2 ${rankColor} px-2 py-0.5 rounded text-[11px] shadow">
+            <div class="absolute top-2 left-2 ${rankColor} px-2 py-0.5 rounded text-[11px] shadow font-bold">
               #${item.rank}
             </div>
-            ${isMarked ? `
+            ${isPinned ? `
+              <div class="absolute top-2 left-12 bg-amber-400 text-slate-950 px-2 py-0.5 rounded text-[11px] font-black shadow flex items-center gap-1 animate-pulse">
+                🎯 PINNED
+              </div>
+            ` : (isMarked ? `
               <div class="absolute top-2 left-12 bg-emerald-500 text-slate-950 px-2 py-0.5 rounded text-[11px] font-bold shadow flex items-center gap-1">
                 ✓ MARKED
               </div>
-            ` : ''}
+            ` : '')}
             <div class="absolute top-2 right-2 bg-slate-950/80 backdrop-blur-md px-2 py-0.5 rounded text-[11px] font-mono text-emerald-400 border border-emerald-500/20 font-bold">
               ${matchPct}%
             </div>
@@ -3103,9 +3684,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 </div>` : ''}
             </div>
 
-            <div class="flex items-center gap-1.5 pt-2 border-t border-slate-800/60">
+            <div class="flex items-center gap-1.5 pt-2 border-t border-slate-800/60 flex-wrap">
               <button onclick="toggleMark('${item.video_id}', ${item.frame_idx}, ${item.pts_time}, event)" class="flex-1 py-1.5 ${isMarked ? 'bg-emerald-500 text-slate-950 font-bold shadow-md shadow-emerald-500/20' : 'bg-slate-800 hover:bg-slate-700 text-emerald-400'} text-[11px] font-semibold rounded transition flex items-center justify-center gap-1">
                 ${isMarked ? '✓ Correct' : '+ Mark'}
+              </button>
+              <button onclick="isolateVideo('${item.video_id}'); event.stopPropagation();" class="px-2 py-1.5 bg-slate-800 hover:bg-slate-700 text-sky-300 border border-sky-500/20 text-[11px] font-semibold rounded transition flex items-center gap-1" title="Chỉ hiển thị các khung hình thuộc video ${item.video_id}">
+                🎬 Isolate
               </button>
               ${currentTaskMode === 'trake' ? `
                 <button onclick="saveTrakeForCard('${item.video_id}', ${item.frame_idx}, ${item.pts_time}, event)" class="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-bold rounded transition flex items-center gap-1 shadow-sm" title="Lưu video này làm đáp án TRAKE cho câu query">
@@ -3123,7 +3707,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <button onclick="copySubmission('${item.video_id}', ${item.frame_idx}, this)" class="px-2 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-semibold rounded transition flex items-center justify-center gap-1">
                 📋 Copy
               </button>
-              <button onclick="openModal(${idx})" class="px-2 py-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-[11px] font-semibold rounded transition flex items-center gap-1">
+              <button onclick="openModal(${origIdx >= 0 ? origIdx : 0})" class="px-2 py-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-[11px] font-semibold rounded transition flex items-center gap-1">
                 ▶ Play
               </button>
             </div>
@@ -3162,6 +3746,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('modalCandidateFrame').innerText = `Frame ${item.frame_idx} (${item.pts_time}s)`;
       document.getElementById('modalASR').innerText = item.matched_asr || '(No direct speech transcript around timestamp)';
 
+      const activeQ = queryPackage.find(q => q.id === activeQueryId);
+      const isPinned = activeQ && activeQ.savedData && activeQ.savedData.pinnedFrame && activeQ.savedData.pinnedFrame.video_id === vid;
+      const pinStatus = document.getElementById('modalPinnedStatus');
+      if (pinStatus) {
+        if (isPinned) {
+          pinStatus.innerHTML = `<span class="text-amber-300 font-bold font-mono">🎯 Frame ${activeQ.savedData.pinnedFrame.frame_idx}</span>`;
+        } else {
+          pinStatus.innerHTML = `<span class="text-slate-500 font-mono">Not Pinned</span>`;
+        }
+      }
+
       // Sync modal clip marks
       const range = videoClipRanges[vid];
       if (range && range.start_sec !== undefined) {
@@ -3194,8 +3789,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
       syncModalModeUI();
 
       videoElem.src = item.video_url;
-      videoElem.currentTime = Math.max(0, item.pts_time - 1.0);
+      const initialFps = item.fps || 25.0;
+      videoElem.currentTime = Math.max(0, (item.frame_idx / initialFps) - 1.0);
       videoElem.play();
+
+      const updateFrameDisplay = () => {
+        const fps = (currentModalItem && currentModalItem.fps) || 25.0;
+        const curSec = videoElem.currentTime;
+        const curFr = Math.max(0, Math.round(curSec * fps));
+        const frLabel = document.getElementById('modalCurrentFrame');
+        if (frLabel) frLabel.innerText = `${curFr} (${formatTime(curSec)})`;
+        if ('requestVideoFrameCallback' in HTMLVideoElement.prototype && !videoElem.paused) {
+          videoElem._rvfcId = videoElem.requestVideoFrameCallback(updateFrameDisplay);
+        }
+      };
+
+      videoElem.onplay = () => {
+        if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+          videoElem._rvfcId = videoElem.requestVideoFrameCallback(updateFrameDisplay);
+        }
+      };
+      videoElem.ontimeupdate = updateFrameDisplay;
+      videoElem.onseeked = updateFrameDisplay;
 
       const copyBtn = document.getElementById('modalCopyBtn');
       copyBtn.onclick = () => {
@@ -3205,6 +3820,80 @@ HTML_PAGE = r"""<!DOCTYPE html>
       };
 
       document.getElementById('detailModal').classList.remove('hidden');
+    }
+
+    function pinModalPlayingFrame() {
+      if (!currentModalItem) return;
+      const fps = currentModalItem.fps || 25.0;
+      const currentSec = videoElem.currentTime;
+      const currentFrame = Math.max(0, Math.round(currentSec * fps));
+      const vid = currentModalItem.video_id;
+
+      currentModalItem.pinned_frame = currentFrame;
+
+      const key = `${vid}_${currentFrame}`;
+      markedMap.set(key, {
+        video_id: vid,
+        frame_idx: currentFrame,
+        pts_time: currentSec,
+        isPinned: true
+      });
+
+      const qid = (document.getElementById('queryIdInput').value || activeQueryId || 'query-1').trim();
+      let query = queryPackage.find(q => q.id === qid);
+      if (query) {
+        if (!query.savedData) query.savedData = {};
+        query.savedData.pinnedFrame = { video_id: vid, frame_idx: currentFrame, pts_time: currentSec };
+        query.savedData.pinnedVideoId = vid;
+        query.status = 'saved';
+      }
+
+      const pinStatus = document.getElementById('modalPinnedStatus');
+      if (pinStatus) {
+        pinStatus.innerHTML = `<span class="text-amber-300 font-bold font-mono">🎯 Frame ${currentFrame} (${formatTime(currentSec)})</span>`;
+      }
+
+      updateMarkedUI();
+      renderGrid(currentResults);
+      saveSessionToLocalStorage();
+      renderQueryNavigator();
+
+      showQuickToast(`🎯 Đã chọn Frame ${currentFrame} (${vid}) làm mốc đáp án chính xác!`);
+    }
+
+    function floodNeighborsModal() {
+      if (!currentModalItem) return;
+      const fps = currentModalItem.fps || 25.0;
+      const currentSec = videoElem.currentTime;
+      const currentFrame = currentModalItem.pinned_frame !== undefined 
+        ? currentModalItem.pinned_frame 
+        : Math.max(0, Math.round(currentSec * fps));
+      const vid = currentModalItem.video_id;
+
+      const neighborRows = generateNeighborFrames(vid, currentFrame, 100, 1);
+      
+      const qid = (document.getElementById('queryIdInput').value || activeQueryId || 'query-1').trim();
+      let query = queryPackage.find(q => q.id === qid);
+      if (query) {
+        if (!query.savedData) query.savedData = {};
+        query.savedData.floodFrames = neighborRows;
+        query.savedData.floodCenter = currentFrame;
+        query.savedData.floodVideoId = vid;
+        query.status = 'saved';
+      }
+
+      markedMap.set(`${vid}_${currentFrame}`, {
+        video_id: vid,
+        frame_idx: currentFrame,
+        pts_time: currentSec,
+        isPinned: true
+      });
+
+      updateMarkedUI();
+      saveSessionToLocalStorage();
+      renderQueryNavigator();
+
+      showQuickToast(`⚡ Đã điền 100 frame liền kề quanh Frame ${currentFrame} (${vid}) vào kết quả xuất bài!`);
     }
 
     function markCurrentModalFrameAndRerank() {
@@ -3217,17 +3906,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
       markedMap.set(`${vid}_${currentFrame}`, {
         video_id: vid,
         frame_idx: currentFrame,
-        pts_time: currentSec
+        pts_time: currentSec,
+        isPinned: false
       });
 
       closeModal();
-      openChatbotForVideo(vid, currentFrame, currentSec);
       executeRerank();
     }
 
     function jumpToCandidate() {
       if (currentModalItem) {
-        videoElem.currentTime = currentModalItem.pts_time;
+        const fps = currentModalItem.fps || 25.0;
+        videoElem.currentTime = currentModalItem.frame_idx / fps;
+        videoElem.pause();
+        const curFr = currentModalItem.frame_idx;
+        const frLabel = document.getElementById('modalCurrentFrame');
+        if (frLabel) frLabel.innerText = `${curFr} (${formatTime(videoElem.currentTime)})`;
       }
     }
 
@@ -3259,6 +3953,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function closeModal() {
       videoElem.pause();
       videoElem.src = '';
+      videoElem.ontimeupdate = null;
+      videoElem.onseeked = null;
+      videoElem.onplay = null;
       document.getElementById('detailModal').classList.add('hidden');
     }
 
@@ -3274,75 +3971,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function exportCSV() {
       const qid = (document.getElementById('queryIdInput').value || 'query-1').trim();
-      let filename = '';
-      let lines = [];
-
-      if (currentTaskMode === 'kis') {
-        filename = `${qid}-kis.csv`;
-        // Format: <video_id>,<frame_idx>
-        if (markedMap.size > 0) {
-          markedMap.forEach(item => {
-            lines.push(`${item.video_id},${item.frame_idx}`);
-          });
-        }
-        // Fill remaining candidates from current search results up to 100 rows
-        currentResults.forEach(r => {
-          const rowStr = `${r.video_id},${r.frame_idx}`;
-          if (!lines.includes(rowStr) && lines.length < 100) {
-            lines.push(rowStr);
-          }
-        });
-      } else if (currentTaskMode === 'qa') {
-        filename = `${qid}-qa.csv`;
-        // Format: <video_id>,<frame_idx>,<answer>
-        if (markedMap.size > 0) {
-          markedMap.forEach(item => {
-            const ans = qaAnswersMap[item.video_id] || '';
-            lines.push(`${item.video_id},${item.frame_idx},${formatCSVField(ans)}`);
-          });
-        }
-        currentResults.forEach(r => {
-          const ans = qaAnswersMap[r.video_id] || '';
-          const rowStr = `${r.video_id},${r.frame_idx},${formatCSVField(ans)}`;
-          if (!lines.some(l => l.startsWith(`${r.video_id},${r.frame_idx}`)) && lines.length < 100) {
-            lines.push(rowStr);
-          }
-        });
-      } else if (currentTaskMode === 'trake') {
-        filename = `${qid}-trake.csv`;
-        // Format: <video_id>,<frame_1>,<frame_2>,<frame_3>,<frame_4>...
-        const targetVids = [];
-        if (markedMap.size > 0) {
-          markedMap.forEach(v => {
-            if (!targetVids.includes(v.video_id)) targetVids.push(v.video_id);
-          });
-        }
-        currentResults.forEach(r => {
-          if (!targetVids.includes(r.video_id)) targetVids.push(r.video_id);
-        });
-
-        targetVids.forEach(vid => {
-          if (lines.length >= 100) return;
-          const events = trakeEventsMap[vid] || [];
-          if (events.length > 0) {
-            const sortedFrames = events.map(e => e.frame_idx).sort((a, b) => a - b);
-            lines.push(`${vid},${sortedFrames.join(',')}`);
-          } else {
-            // Fallback: use top keyframes found for this video
-            const kfs = currentResults.filter(r => r.video_id === vid).map(r => r.frame_idx).slice(0, 4);
-            if (kfs.length > 0) {
-              lines.push(`${vid},${kfs.join(',')}`);
-            }
-          }
-        });
+      let query = queryPackage.find(q => q.id === qid);
+      if (!query) {
+        saveActiveQueryResult();
+        query = queryPackage.find(q => q.id === qid);
       }
+
+      const filename = `${qid}-${currentTaskMode}.csv`;
+      const lines = buildCSVLinesForQuery(query);
 
       if (lines.length === 0) {
         alert("Không có kết quả nào để xuất CSV. Vui lòng thực hiện tìm kiếm trước.");
         return;
       }
 
-      const csvContent = lines.join(String.fromCharCode(10));
+      const csvContent = lines.join(String.fromCharCode(10)) + String.fromCharCode(10);
       const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -3355,7 +3998,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // Initialize Settings & Task Mode on DOM ready
     window.addEventListener('DOMContentLoaded', () => {
       loadChatSettings();
-      loadSampleQueries();
+      const restored = loadSessionFromLocalStorage();
+      if (!restored) {
+        renderQueryNavigator();
+      }
     });
   </script>
 </body>
