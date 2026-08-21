@@ -142,27 +142,25 @@ def evaluate_single_model(cand: Dict[str, Any], segments: List[str], device: str
     }
 
     if quant == "4bit":
-        try:
-            from transformers import BitsAndBytesConfig
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
-            load_kwargs["quantization_config"] = bnb_config
-            load_kwargs["device_map"] = {"": device}
-        except Exception as qe:
-            print(f"[!] Warning: bitsandbytes 4bit failed ({qe}), attempting standard load with fp16.", file=sys.stderr)
-            dtype = torch.float16
-            load_kwargs["torch_dtype"] = dtype
-            load_kwargs["device_map"] = {"": device}
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+        load_kwargs["quantization_config"] = bnb_config
+        load_kwargs["device_map"] = {"": device}
+        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
     else:
         dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
-        load_kwargs["torch_dtype"] = dtype
-        load_kwargs["device_map"] = {"": device}
-
-    model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+        load_kwargs["dtype"] = dtype
+        try:
+            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs).to(device)
+        except TypeError:
+            if "dtype" in load_kwargs:
+                load_kwargs["torch_dtype"] = load_kwargs.pop("dtype")
+            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs).to(device)
     model.eval()
     load_time = time.time() - t0
     print(f"✓ Model loaded in {load_time:.2f}s")
@@ -250,6 +248,8 @@ def main():
             res = evaluate_single_model(cand, BENCHMARK_SEGMENTS, device=args.device)
             results.append(res)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"[!] Error evaluating {cand['display_name']}: {e}", file=sys.stderr)
 
     # Print Detailed Side-by-Side Quality Comparison
