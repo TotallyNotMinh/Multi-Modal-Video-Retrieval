@@ -1,4 +1,4 @@
-# 🇻🇳 AIC 2026 - Multi-Modal Video Retrieval Studio
+# Multi-Modal Video Retrieval Studio
 
 An end-to-end, high-throughput multi-modal video retrieval and analysis platform.
 
