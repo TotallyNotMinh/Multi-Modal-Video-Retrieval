@@ -20,6 +20,10 @@ import re
 import argparse
 from typing import List, Dict, Any
 
+# Bypass broken torchvision op registrations in Kaggle/custom environments
+for _mod in ["torchvision", "torchvision.io", "torchvision.ops", "torchvision._meta_registrations"]:
+    sys.modules[_mod] = None
+
 # Ensure repo root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
