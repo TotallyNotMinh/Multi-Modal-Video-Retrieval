@@ -49,9 +49,10 @@ class BM25Engine:
         self.df = Counter()
         self.N = 0
         self.inverted_index = defaultdict(list)  # token -> [(doc_idx, tf)]
+        self.video_asr_timeline = defaultdict(list)  # video_id -> [(start_sec, end_sec, text)]
 
     def index_transcripts(self, asr_dir: str = "cache/asr_transcripts"):
-        print("   • Indexing Vietnamese ASR transcripts for BM25...")
+        print("   • Indexing Vietnamese ASR transcripts for BM25 & Temporal Subtitles...")
         t0 = time.time()
         files = sorted(glob.glob(f"{asr_dir}/*.json"))
         
@@ -60,10 +61,16 @@ class BM25Engine:
             try:
                 with open(f, "r", encoding="utf-8") as fp:
                     segs = json.load(fp)
+                if isinstance(segs, dict):
+                    segs = segs.get("segments", [])
                 for s in segs:
                     raw_txt = s.get("cleaned_text", s.get("text", "")).strip()
                     if not raw_txt:
                         continue
+                    st = float(s.get("start_sec", s.get("start", 0.0)))
+                    et = float(s.get("end_sec", s.get("end", st + 1.0)))
+                    self.video_asr_timeline[vid].append((st, et, raw_txt))
+
                     tokens = self.tokenize(raw_txt)
                     if not tokens:
                         continue
@@ -72,8 +79,8 @@ class BM25Engine:
                     self.docs.append({
                         "video_id": vid,
                         "scene_id": s.get("scene_id", ""),
-                        "start_sec": s.get("start_sec", 0.0),
-                        "end_sec": s.get("end_sec", 0.0),
+                        "start_sec": st,
+                        "end_sec": et,
                         "text": raw_txt,
                         "tokens": tokens
                     })
@@ -85,6 +92,10 @@ class BM25Engine:
                         self.inverted_index[t].append((doc_idx, tf))
             except Exception:
                 continue
+
+        # Sort timeline segments by start_sec for fast temporal queries
+        for vid in self.video_asr_timeline:
+            self.video_asr_timeline[vid].sort(key=lambda x: x[0])
 
         self.N = len(self.docs)
         self.avgdl = sum(self.doc_len) / max(1, self.N)
@@ -190,6 +201,35 @@ class SearchEngine:
         
         print(f"✅ Search Engine ready in {time.time() - t0:.2f}s!")
 
+    def get_asr_at_pts(self, video_id: str, pts_time: float, max_dist_sec: float = 15.0) -> str:
+        """
+        Retrieves the exact active speech transcript at pts_time, or nearest segment within max_dist_sec.
+        """
+        timeline = self.bm25.video_asr_timeline.get(video_id, [])
+        if not timeline:
+            return ""
+
+        # 1. Exact active segment (with 1.5s tolerance around boundaries)
+        for st, et, txt in timeline:
+            if (st - 1.5) <= pts_time <= (et + 1.5):
+                return txt
+
+        # 2. Nearest segment within max_dist_sec
+        best_txt = ""
+        min_dist = float("inf")
+        best_st = 0.0
+        for st, et, txt in timeline:
+            mid = (st + et) / 2.0
+            dist = abs(mid - pts_time)
+            if dist < min_dist:
+                min_dist = dist
+                best_txt = txt
+                best_st = st
+
+        if min_dist <= max_dist_sec and best_txt:
+            return f"[{best_st:.1f}s] {best_txt}"
+        return ""
+
     def get_video_context(self, video_id: str, pts_time: float = 0.0, window_sec: float = 45.0) -> Dict:
         """
         Extracts temporal speech transcripts (ASR) and on-screen OCR text around pts_time for video_id.
@@ -201,9 +241,11 @@ class SearchEngine:
             try:
                 with open(asr_file, "r", encoding="utf-8") as fp:
                     raw_segs = json.load(fp)
+                    if isinstance(raw_segs, dict):
+                        raw_segs = raw_segs.get("segments", [])
                     for s in raw_segs:
-                        st = float(s.get("start_sec", 0.0))
-                        et = float(s.get("end_sec", 0.0))
+                        st = float(s.get("start_sec", s.get("start", 0.0)))
+                        et = float(s.get("end_sec", s.get("end", st + 1.0)))
                         txt = s.get("cleaned_text", s.get("text", "")).strip()
                         if txt:
                             is_near = (abs(st - pts_time) <= window_sec) or (abs(et - pts_time) <= window_sec) or (st <= pts_time <= et)
@@ -672,6 +714,10 @@ class SearchEngine:
             f_idx = rec["frame_idx"]
             fps = rec.get("fps", 25.0)
 
+            asr_text = keyframe_asr_texts.get(idx, "")
+            if not asr_text:
+                asr_text = self.get_asr_at_pts(vid, pts)
+
             results.append({
                 "rank": rank,
                 "video_id": vid,
@@ -680,7 +726,7 @@ class SearchEngine:
                 "pts_time": round(pts, 4),
                 "dense_score": round(float(dense_scores[idx]), 4),
                 "score": round(float(fused_scores[idx]), 4),
-                "matched_asr": keyframe_asr_texts.get(idx, ""),
+                "matched_asr": asr_text,
                 "thumb_url": f"/api/frame?video_id={vid}&frame_idx={f_idx}",
                 "video_url": f"/api/video?video_id={vid}"
             })
@@ -838,6 +884,10 @@ class SearchEngine:
             f_idx = rec["frame_idx"]
             fps = rec.get("fps", 25.0)
             score_val = 1.0 if idx in pos_set else round(float(fused_scores[idx]), 4)
+            asr_text = keyframe_asr_texts.get(idx, "")
+            if not asr_text:
+                asr_text = self.get_asr_at_pts(vid, pts)
+
             results.append({
                 "rank": rank,
                 "video_id": vid,
@@ -846,7 +896,7 @@ class SearchEngine:
                 "pts_time": round(pts, 4),
                 "dense_score": 1.0 if idx in pos_set else round(float(dense_scores[idx]), 4),
                 "score": score_val,
-                "matched_asr": keyframe_asr_texts.get(idx, ""),
+                "matched_asr": asr_text,
                 "thumb_url": f"/api/frame?video_id={vid}&frame_idx={f_idx}",
                 "video_url": f"/api/video?video_id={vid}"
             })
@@ -862,6 +912,7 @@ class SearchEngine:
                 p_fps = float(p.get("fps", 25.0))
                 # Remove any existing match to avoid duplicate
                 results = [r for r in results if not (r["video_id"] == p_vid and r["frame_idx"] == p_fid)]
+                p_asr = self.get_asr_at_pts(p_vid, p_pts)
                 pinned_results.append({
                     "rank": 1,
                     "video_id": p_vid,
@@ -870,7 +921,7 @@ class SearchEngine:
                     "pts_time": round(p_pts, 2),
                     "dense_score": 1.0,
                     "score": 1.0,
-                    "matched_asr": "🎯 Pinned Match",
+                    "matched_asr": f"🎯 Pinned Match · {p_asr}" if p_asr else "🎯 Pinned Match",
                     "thumb_url": f"/api/frame?video_id={p_vid}&frame_idx={p_fid}",
                     "video_url": f"/api/video?video_id={p_vid}",
                     "is_pinned": True
@@ -3745,6 +3796,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('modalVideo').innerText = vid;
       document.getElementById('modalCandidateFrame').innerText = `Frame ${item.frame_idx} (${item.pts_time}s)`;
       document.getElementById('modalASR').innerText = item.matched_asr || '(No direct speech transcript around timestamp)';
+      let currentModalSegments = [];
+      fetch(`/api/video_context?video_id=${encodeURIComponent(vid)}&pts_time=${item.pts_time}`)
+        .then(r => r.json())
+        .then(data => {
+          if (data && data.asr_segments && data.asr_segments.length > 0) {
+            currentModalSegments = data.asr_segments;
+            updateModalSubtitle(videoElem.currentTime);
+          }
+        }).catch(() => {});
 
       const activeQ = queryPackage.find(q => q.id === activeQueryId);
       const isPinned = activeQ && activeQ.savedData && activeQ.savedData.pinnedFrame && activeQ.savedData.pinnedFrame.video_id === vid;
@@ -3793,12 +3853,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
       videoElem.currentTime = Math.max(0, (item.frame_idx / initialFps) - 1.0);
       videoElem.play();
 
+      const updateModalSubtitle = (curSec) => {
+        if (!currentModalSegments || currentModalSegments.length === 0) return;
+        let found = null;
+        for (const seg of currentModalSegments) {
+          if ((seg.start_sec - 0.8) <= curSec && curSec <= (seg.end_sec + 0.8)) {
+            found = seg;
+            break;
+          }
+        }
+        const asrEl = document.getElementById('modalASR');
+        if (asrEl) {
+          if (found) {
+            asrEl.innerText = `[${found.start_sec.toFixed(1)}s - ${found.end_sec.toFixed(1)}s] ${found.text}`;
+          } else if (item.matched_asr && Math.abs(curSec - item.pts_time) < 4.0) {
+            asrEl.innerText = item.matched_asr;
+          }
+        }
+      };
+
       const updateFrameDisplay = () => {
         const fps = (currentModalItem && currentModalItem.fps) || 25.0;
         const curSec = videoElem.currentTime;
         const curFr = Math.max(0, Math.round(curSec * fps));
         const frLabel = document.getElementById('modalCurrentFrame');
         if (frLabel) frLabel.innerText = `${curFr} (${formatTime(curSec)})`;
+        updateModalSubtitle(curSec);
         if ('requestVideoFrameCallback' in HTMLVideoElement.prototype && !videoElem.paused) {
           videoElem._rvfcId = videoElem.requestVideoFrameCallback(updateFrameDisplay);
         }
