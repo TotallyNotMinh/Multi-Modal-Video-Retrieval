@@ -10,34 +10,55 @@ The system combines **SigLIP dense visual feature search**, **LLM-refined PhoWhi
 
 ```mermaid
 flowchart TD
-    subgraph Offline["Offline Indexing Pipeline"]
-        V["Dataset Videos (.mp4)"] --> K["Keyframe Extraction<br>(177k frames)"]
-        V --> A["PhoWhisper ASR<br>(873 videos)"]
-        V --> O["PaddleOCR Text"]
+    %% Styling definitions
+    classDef offline fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+    classDef online fill:#0f172a,stroke:#818cf8,stroke-width:2px,color:#f8fafc;
+    classDef stage2 fill:#18181b,stroke:#34d399,stroke-width:2px,color:#f8fafc;
+    classDef data fill:#334155,stroke:#94a3b8,stroke-width:1px,color:#f1f5f9;
+
+    subgraph PHASE1 ["<b>PHASE 1: MULTI-MODAL EXTRACTION & INDEXING</b>"]
+        direction TB
+        V["<b>Raw Video Corpus (.mp4)</b><br>873 Videos / 120+ Hours"]:::data
+
+        V -->|I-Frame Extraction| KF["<b>Keyframe Extraction</b><br>177,321 Keyframes"]:::data
+        V -->|Silero VAD + PhoWhisper| ASR["<b>Speech ASR</b><br>16,660 Audio Segments"]:::data
+        V -->|EasyOCR / PaddleOCR| OCR["<b>On-Screen OCR Banners</b><br>18,451 Text Detections"]:::data
+
+        KF -->|SigLIP SO400M / CLIP| SIG_IDX["<b>Visual Feature Matrix</b><br><code>cache/features_matrix.npy</code> (177k × 512)"]:::offline
+        ASR -->|LLM Context Correction| REF_ASR["<b>Refined Transcripts</b><br>Diacritics & Proper Nouns Fixed"]:::offline
         
-        K --> SIG["SigLIP SO400M Visual Embeddings<br><code>features_matrix.npy</code>"]
-        
-        A --> REF["LLM ASR Refinement<br>(Qwen / MiMo / Gemini)"]
-        REF --> REFD["Refined Transcripts<br><code>cache/asr_transcripts_refined/</code>"]
-        
-        REFD --> E5["E5-Large Dense Embeddings<br><code>transcript_semantic.index</code>"]
-        REFD --> BM["Inverted BM25 Index<br>(Vietnamese Lexical)"]
-        O --> BM
+        REF_ASR -->|E5-Large FP16| E5_IDX["<b>Dense Semantic Index</b><br>FAISS IndexFlatIP (16.6k × 1024)"]:::offline
+        REF_ASR & OCR -->|Robertson-Spärck Jones IDF| BM25_IDX["<b>Inverted BM25 Index</b><br>35,111 Speech & OCR Documents"]:::offline
     end
 
-    subgraph Online["Online Tri-Modal Retrieval"]
-        Q["User Query (Vietnamese / English)"] --> TR["Query Translator & Prompt Ensembling"]
-        TR --> QV["SigLIP Text Vector"]
-        Q --> QE["E5 Passage Query"]
-        Q --> QB["BM25 Lexical Query"]
+    subgraph PHASE2 ["<b>PHASE 2: STAGE 1 HYBRID CANDIDATE RETRIEVAL (80–120ms)</b>"]
+        direction TB
+        Q["<b>User Natural Language Query (VI / EN)</b>"]:::data
         
-        QV --> FS["SigLIP Visual Dot Product"]
-        QE --> FAISS["FAISS Semantic Search"]
-        QB --> BM25S["BM25 Scoring"]
+        Q -->|Query Translator & Prompt Ensemble| Q_VIS["<b>Visual Concept Vector</b>"]:::online
+        Q -->|Passage Formatter| Q_E5["<b>E5 Query Vector</b>"]:::online
+        Q -->|Lexical Tokenizer| Q_BM25["<b>BM25 Query Tokens</b>"]:::online
+
+        Q_VIS -->|Cosine Dot Product| SCORE_VIS["<b>Visual Dense Scores</b>"]:::online
+        Q_E5 -->|FAISS Semantic Search| SCORE_E5["<b>Speech Semantic Scores</b>"]:::online
+        Q_BM25 -->|BM25 Inverted Search| SCORE_BM25["<b>Speech + OCR Lexical Scores</b>"]:::online
+
+        SCORE_VIS & SCORE_E5 & SCORE_BM25 --> FUSE["<b>Calibrated Tri-Modal Fusion & Temporal Smoothing</b><br>• Sigmoidal Soft-Saturation Calibration<br>• ±3.0s Temporal Window Aggregation<br>• Temporal NMS Shot Deduplication"]:::online
         
-        FS & FAISS & BM25S --> FUSE["Multi-Modal Temporal Fusion<br>+ 1D Gaussian Shot Smoothing<br>+ Shot Deduplication"]
-        FUSE --> UI["Interactive Web Studio UI<br>(KIS / Q&A / TRAKE)"]
+        FUSE --> TOP_CANDS["<b>Top 50 Ranked Video Clips & Timestamps</b>"]:::online
     end
+
+    subgraph PHASE3 ["<b>PHASE 3: STAGE 2 MULTI-MODAL VERIFICATION & WEB STUDIO</b>"]
+        direction TB
+        TOP_CANDS --> CLIP_PICK["<b>Selected Candidate Video Clip</b><br>[start_sec, end_sec]"]:::stage2
+        
+        CLIP_PICK --> VLM["<b>Stage 2 Neural Cross-Encoder & VLM Assistant</b><br>• BGE-Reranker-v2-m3 Evidence Scoring (6.0ms)<br>• 6× 512px Clip Frames + ASR Window + OCR Context<br>• Adversarial Unanswerable Query Detection (TNR 69.1%, TPR 70.6%)"]:::stage2
+        
+        VLM --> OUT_ANS["<b>Verified Answer & Timestamp Grounding</b><br>or <b>'Information Not Present' Abstention</b>"]:::stage2
+        OUT_ANS --> STUDIO["<b>Interactive Multi-Modal Retrieval Studio</b><br><code>http://localhost:8080</code> (Timeline Viewer, Keyframe Flooding, QA)"]:::stage2
+    end
+
+    PHASE1 --> PHASE2 --> PHASE3
 ```
 
 ### 1. 🖼️ Dense Visual Search (SigLIP)
