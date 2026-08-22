@@ -87,9 +87,12 @@ class QueryTranslator:
         cleaned = query.strip()
         for p in prefixes:
             cleaned = re.sub(p, "", cleaned, flags=re.IGNORECASE).strip()
+        self._omniroute_available = True
         return cleaned
 
     def _translate_via_omniroute(self, text: str) -> Optional[str]:
+        if not getattr(self, "_omniroute_available", True):
+            return None
         body = {
             "model": self.model_name,
             "messages": [
@@ -102,13 +105,14 @@ class QueryTranslator:
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(self.omniroute_url, data=data, headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=3) as resp:
+            with urllib.request.urlopen(req, timeout=0.5) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
                 translated = res["choices"][0]["message"]["content"].strip()
                 translated = re.sub(r"^[\"']|[\"']$", "", translated).strip()
                 if translated:
                     return translated
         except Exception:
+            self._omniroute_available = False
             return None
         return None
 
@@ -121,8 +125,8 @@ class QueryTranslator:
             return self.cache[cleaned]
 
         res = None
-        # 1. High-fidelity translation via OmniRoute LLM
-        if self.use_online:
+        # 1. High-fidelity translation via OmniRoute LLM (fast fail)
+        if self.use_online and getattr(self, "_omniroute_available", True):
             res = self._translate_via_omniroute(cleaned)
 
         # 2. GoogleTranslator fallback
