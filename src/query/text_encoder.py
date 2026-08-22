@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 from typing import List, Union
 import open_clip
@@ -36,16 +37,14 @@ class CLIPTextEncoder:
         tokens = self.tokenizer(texts).to(self.device)
         text_features = self.model.encode_text(tokens)
         
-        # Robust L2 Normalize with zero-clamp
-        norms = text_features.norm(dim=-1, keepdim=True).clamp(min=1e-12)
-        text_features = text_features / norms
-        feats_np = text_features.cpu().numpy().astype(np.float32)
+        # GPU L2 Normalize
+        text_features = F.normalize(text_features, p=2, dim=-1)
 
         if ensemble and len(texts) > 1:
-            mean_vec = np.mean(feats_np, axis=0, keepdims=True)
-            norm = np.linalg.norm(mean_vec)
-            if norm > 1e-12:
-                mean_vec = mean_vec / norm
-            return mean_vec[0]
-            
+            mean_feat = text_features.mean(dim=0, keepdim=True)
+            mean_feat = F.normalize(mean_feat, p=2, dim=-1)
+            return mean_feat.squeeze(0).cpu().numpy().astype(np.float32)
+
+        feats_np = text_features.cpu().numpy().astype(np.float32)
         return feats_np[0] if len(texts) == 1 else feats_np
+

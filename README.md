@@ -2,7 +2,67 @@
 
 An end-to-end, high-throughput multi-modal video retrieval and analysis platform.
 
-The system combines **SigLIP dense visual feature search**, **PhoWhisper ASR speech transcription**, **PaddleOCR on-screen text extraction**, **BM25 inverted lexical indexing**, and an interactive real-time web studio for **KIS (Known-Item Search)**, **Q&A**, and **TRAKE (Temporal Action Event Localization)**.
+The system combines **SigLIP dense visual feature search**, **LLM-refined PhoWhisper ASR speech transcription**, **intfloat/multilingual-e5-large dense semantic text search**, **PaddleOCR on-screen text extraction**, **BM25 inverted lexical indexing**, and an interactive real-time web studio for **KIS (Known-Item Search)**, **Q&A**, and **TRAKE (Temporal Action Event Localization)**.
+
+---
+
+## 🌟 Core Features & Architecture
+
+```mermaid
+flowchart TD
+    subgraph Offline["Offline Indexing Pipeline"]
+        V["Dataset Videos (.mp4)"] --> K["Keyframe Extraction<br>(177k frames)"]
+        V --> A["PhoWhisper ASR<br>(873 videos)"]
+        V --> O["PaddleOCR Text"]
+        
+        K --> SIG["SigLIP SO400M Visual Embeddings<br><code>features_matrix.npy</code>"]
+        
+        A --> REF["LLM ASR Refinement<br>(Qwen / MiMo / Gemini)"]
+        REF --> REFD["Refined Transcripts<br><code>cache/asr_transcripts_refined/</code>"]
+        
+        REFD --> E5["E5-Large Dense Embeddings<br><code>transcript_semantic.index</code>"]
+        REFD --> BM["Inverted BM25 Index<br>(Vietnamese Lexical)"]
+        O --> BM
+    end
+
+    subgraph Online["Online Tri-Modal Retrieval"]
+        Q["User Query (Vietnamese / English)"] --> TR["Query Translator & Prompt Ensembling"]
+        TR --> QV["SigLIP Text Vector"]
+        Q --> QE["E5 Passage Query"]
+        Q --> QB["BM25 Lexical Query"]
+        
+        QV --> FS["SigLIP Visual Dot Product"]
+        QE --> FAISS["FAISS Semantic Search"]
+        QB --> BM25S["BM25 Scoring"]
+        
+        FS & FAISS & BM25S --> FUSE["Multi-Modal Temporal Fusion<br>+ 1D Gaussian Shot Smoothing<br>+ Shot Deduplication"]
+        FUSE --> UI["Interactive Web Studio UI<br>(KIS / Q&A / TRAKE)"]
+    end
+```
+
+### 1. 🖼️ Dense Visual Search (SigLIP)
+- **Model:** `google/siglip-so400m-patch14-384` / OpenCLIP.
+- **Index:** Matrix dot product over **177,321 keyframe vectors** with cosine normalization.
+- **Prompt Ensembling & Query Translation:** Automatic Vietnamese $\leftrightarrow$ English query expansion and ensemble prompting for visual concepts.
+
+### 2. 🗣️ Conservative LLM Transcript Refinement
+- **100% Corpus Refinement:** All 873 video transcripts (16,660 segments) processed.
+- **Segment Tagging (`<SEGMENT_i>`):** Strictly preserves temporal boundaries and video start/end timestamps.
+- **Error Correction:** Fixes missing Vietnamese diacritics, broken words, phonetic homophones, and misheard proper nouns without hallucination or stylistic paraphrasing.
+
+### 3. 🧠 Dense Semantic Speech Indexing (Multilingual-E5)
+- **Model:** `intfloat/multilingual-e5-large` (1024-dim, FP16 GPU accelerated).
+- **Index:** `FAISS IndexFlatIP` over all 16,660 refined transcript passages.
+- **Conceptual Matching:** Discovers semantic intent even with zero keyword overlap (e.g., *"miền Tây"* $\leftrightarrow$ *"Đồng bằng sông Cửu Long / Tây Nam Bộ"*).
+
+### 4. 🔤 Exact Lexical & OCR Search (BM25)
+- **Inverted Index:** Fast inverted index with Robertson-Spärck Jones IDF over refined transcripts and on-screen OCR text.
+- **Named Entity Precision:** Guarantees exact matches for proper nouns, acronyms, license plates, locations, and numbers.
+
+### 5. 🎯 Tri-Modal Temporal Fusion & Smoothing
+- **Temporal Alignment:** Maps segment-level transcript scores to video keyframe timelines with $\pm 3\text{s}$ window aggregation.
+- **1D Gaussian Temporal Smoothing:** Smooths scores across continuous scene shots.
+- **Shot Deduplication / NMS:** Deduplicates adjacent keyframes within $\pm 2\text{s}$ in the same video to maximize Recall@K diversity.
 
 ---
 
@@ -18,29 +78,34 @@ The system combines **SigLIP dense visual feature search**, **PhoWhisper ASR spe
 │   └── objects-aic25-b1/                 # Precomputed object detection annotations
 │
 ├── cache/                                # Precomputed feature matrices and indexed metadata
-│   ├── features_matrix.npy               # SigLIP visual embeddings matrix (177k keyframes × 1152-d)
+│   ├── features_matrix.npy               # SigLIP visual embeddings matrix (177k keyframes)
 │   ├── faiss_siglip_meta.pkl             # Global keyframe metadata records
-│   ├── faiss_siglip.index                # Indexed vector index
-│   ├── asr_transcripts/                  # 873 ASR speech transcript JSON files (timestamped)
+│   ├── faiss_siglip.index                # Indexed visual vector index
+│   ├── asr_transcripts/                  # 873 raw ASR speech transcript JSON files
+│   ├── asr_transcripts_refined/          # 873 LLM-refined ASR transcript JSON files
+│   ├── transcript_embeddings.npy         # Dense E5-large transcript embeddings (16,660 x 1024)
+│   ├── transcript_semantic.index         # FAISS dense vector index for transcripts
+│   ├── transcript_semantic_meta.pkl      # Transcript segment metadata ledger
 │   ├── ocr_text/                         # Extracted on-screen OCR text JSON files
-│   ├── objects_index.pkl                 # Spatial object index
 │   └── thumbnails/                       # Extracted/cached frame previews
 │
-├── scripts/                              # Processing, extraction & benchmarking scripts
+├── scripts/                              # Processing, extraction & indexing scripts
+│   ├── build_transcript_index.py        # Build dense FAISS index with E5-Large over refined transcripts
 │   ├── extract_siglip_features.py        # Extract frame embeddings using SigLIP-SO400M
 │   ├── extract_whisper_asr.py            # Batch audio extraction & PhoWhisper speech transcription
-│   ├── evaluate_candidate_models.py      # LLM ASR transcript refinement arena (multi-GPU auto-sharded)
-│   ├── run_dual_gpu_refinement.py        # Distributed dual-GPU refinement runner
+│   ├── refine_transcripts_qwen.py        # Local Qwen2.5/Qwen3 LLM transcript refinement
+│   ├── run_dual_gpu_refinement.py        # Distributed dual-GPU parallel refinement runner
+│   ├── refine_transcripts_mimo.py        # API-based transcript refinement pipeline
+│   ├── evaluate_candidate_models.py      # LLM ASR transcript refinement arena
 │   ├── extract_ocr.py                    # On-screen text extraction via OCR
-│   ├── convert_transcripts.py            # JSON <-> TXT batch transcript conversion
 │   └── share_ngrok.py                    # Public tunnel helper for remote hosting
 │
 ├── src/                                  # Core library modules
-│   ├── encoding/                         # SigLIP vision encoder, PhoWhisper ASR
-│   ├── index/                            # Frame mapper, metadata indexer
+│   ├── encoding/                         # SigLIP vision encoder, E5 transcript encoder
+│   ├── index/                            # Frame mapper, semantic indexer, metadata indexer
 │   ├── query/                            # Query translator, prompt ensembling
-│   ├── retrieval/                        # Fusion retrieval, video decoder
-│   └── ui/                               # Search web app (HTTP server + Tailwind frontend)
+│   ├── retrieval/                        # Tri-modal fusion, hybrid transcript engine, video decoder
+│   └── ui/                               # Search web studio (HTTP server + Tailwind frontend)
 │       └── search_app.py
 │
 └── kaggle_dual_gpu_refinement.ipynb      # Kaggle multi-GPU refinement notebook
@@ -100,12 +165,12 @@ python src/ui/search_app.py
 ```
 
 - **Local URL:** `http://localhost:8080`
-- The web app provides:
-  - **Instant Visual & Lexical Hybrid Search:** Weighted combination of SigLIP visual embeddings + BM25 Vietnamese speech dialogue & OCR.
-  - **Live Subtitle Display:** Automatic temporal alignment showing speech dialogue below each video card.
+- **Search Capabilities:**
+  - **Tri-Modal Fusion:** Combined SigLIP visual embeddings + BM25 lexical search + E5 dense semantic matching on refined transcripts.
+  - **Live Subtitle Display:** Automatic temporal alignment displaying speech dialogue below each video card.
   - **Interactive Modal Video Player:** Live timestamp tracking, subtitle sync, speed control, and one-click submission copying (`VideoID,FrameIdx`).
   - **Task Modes:**
-    - **KIS (Known-Item Search):** Keyframe pinning, relevance feedback, negative refinement.
+    - **KIS (Known-Item Search):** Keyframe pinning, relevance feedback, negative refinement, neighbor frame flooding.
     - **Q&A Mode:** In-line answer input, character counters, and question package management.
     - **TRAKE Mode:** Temporal event sequence marker with multi-frame segment saving.
 
@@ -116,9 +181,28 @@ python scripts/share_ngrok.py --port 8080
 
 ---
 
-## 🛠️ Data Processing & Feature Extraction
+## 🛠️ Offline Indexing & Processing Commands
 
-### 1. Extract Speech Transcripts (ASR)
+### 1. Build Dense Semantic Transcript Index (E5-Large)
+```bash
+python scripts/build_transcript_index.py \
+    --refined-dir cache/asr_transcripts_refined \
+    --raw-dir cache/asr_transcripts \
+    --model intfloat/multilingual-e5-large \
+    --batch-size 64 \
+    --device cuda
+```
+
+### 2. Run Multi-GPU ASR Transcript Refinement
+```bash
+# Dual-GPU Parallel Runner (Kaggle or local 2x GPU node)
+python scripts/run_dual_gpu_refinement.py \
+    --model-id Qwen/Qwen2.5-1.5B-Instruct \
+    --batch-size 12 \
+    --num-gpus 2
+```
+
+### 3. Extract Speech Transcripts (PhoWhisper)
 ```bash
 python scripts/extract_whisper_asr.py \
     --device cuda:0 \
@@ -126,13 +210,7 @@ python scripts/extract_whisper_asr.py \
     --batch-size 32
 ```
 
-### 2. Benchmark Candidate LLMs for Vietnamese ASR Refinement
-```bash
-# Runs multi-GPU auto-sharding benchmark comparing Sailor2-8B, Qwen2.5-7B, SeaLLMs-v3-7B, Qwen2.5-14B (4-bit)
-python scripts/evaluate_candidate_models.py
-```
-
-### 3. Extract SigLIP Visual Embeddings
+### 4. Extract SigLIP Visual Embeddings
 ```bash
 python scripts/extract_siglip_features.py \
     --model-name google/siglip-so400m-patch14-384 \

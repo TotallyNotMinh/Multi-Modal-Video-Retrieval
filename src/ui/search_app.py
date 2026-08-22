@@ -1,5 +1,10 @@
 import os
 import sys
+
+# Silence non-critical FFmpeg/H.264 decoder seeking warnings (e.g., mmco: unref short failure)
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+
 import glob
 import json
 import time
@@ -11,108 +16,202 @@ import re
 import math
 from collections import Counter, defaultdict
 import numpy as np
+import torch
 import cv2
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 # Ensure workspace root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from src.query.text_encoder import CLIPTextEncoder
 from src.query.translator import QueryTranslator
+from src.index.transcript_semantic_index import TranscriptSemanticIndex
+from src.retrieval.reranker import BGEReranker
+from src.retrieval.context_expander import TranscriptContextExpander
+
+
+def sanitize_video_id(video_id: Any) -> str:
+    """Sanitizes video_id against path traversal and special characters."""
+    if not video_id:
+        return ""
+    cleaned = os.path.basename(str(video_id).strip())
+    return re.sub(r"[^a-zA-Z0-9_\-]", "", cleaned)
 
 
 # Vietnamese Stopwords & Common Noise Words to Filter
 VI_STOPWORDS = {
     "là", "của", "và", "có", "trong", "được", "cho", "với", "các", "ở", "này",
-
     "đã", "để", "những", "khi", "ra", "đến", "về", "như", "tại", "từ", "vào",
-
-    "lại", "đang", "theo", "sẽ", "đó", "thì", "sau",
-
-    "cũng", "trên", "còn", "qua", "lên", "bị", "hơn", "đây",
-
-    "nhất", "hay", "cùng", "nhưng", "vừa", "thêm"
+    "bị", "bởi", "lại", "thì", "mà", "cũng", "đang", "sẽ", "phải", "qua",
+    "sau", "trước", "theo", "gì", "ai", "nào", "đâu", "đây", "đó", "hãy",
+    "một", "hai", "ba", "bốn", "năm", "sáu", "bảy", "tám", "chín", "mười",
+    "nhiều", "rất", "quá", "lắm", "hơn", "nhất", "như_thế_nào", "tại_sao"
 }
 
 
 class BM25Engine:
-    """
-    High-speed Inverted BM25 Search Engine over refined ASR transcripts and OCR text.
-    """
     def __init__(self, k1: float = 1.5, b: float = 0.75):
         self.k1 = k1
         self.b = b
-        self.docs = []  # List of segment dicts
+        self.docs = []  # List[Dict] with 'video_id', 'start_sec', 'end_sec', 'text'
         self.doc_len = []
         self.avgdl = 0.0
-        self.df = Counter()
+        self.inverted_index = defaultdict(list)  # word -> List[(doc_idx, tf)]
+        self.df = defaultdict(int)  # word -> doc_freq
         self.N = 0
-        self.inverted_index = defaultdict(list)  # token -> [(doc_idx, tf)]
-        self.video_asr_timeline = defaultdict(list)  # video_id -> [(start_sec, end_sec, text)]
+        self.video_asr_timeline = defaultdict(list)  # video_id -> List[(st, et, txt)]
 
-    def index_transcripts(self, asr_dir: str = "cache/asr_transcripts"):
+    def _tokenize(self, text: str) -> List[str]:
+        # Normalize and split into lowercased alphanumeric tokens
+        clean_text = re.sub(r"[^\w\s]", " ", text.lower())
+        tokens = [t for t in clean_text.split() if len(t) > 1 or t.isalnum()]
+        return tokens
+
+    def index_transcripts(self, refined_dir: str = "cache/asr_transcripts_refined", raw_dir: str = "cache/asr_transcripts"):
         print("   • Indexing Vietnamese ASR transcripts for BM25 & Temporal Subtitles...")
         t0 = time.time()
-        files = sorted(glob.glob(f"{asr_dir}/*.json"))
         
-        for f in files:
-            vid = os.path.splitext(os.path.basename(f))[0]
+        # 1. Discover all transcript JSON files (Prioritize refined)
+        refined_files = {
+            os.path.splitext(os.path.basename(p))[0]: p
+            for p in glob.glob(f"{refined_dir}/*.json")
+        }
+        raw_files = {
+            os.path.splitext(os.path.basename(p))[0]: p
+            for p in glob.glob(f"{raw_dir}/*.json")
+        }
+        
+        all_vids = sorted(list(set(refined_files.keys()) | set(raw_files.keys())))
+        if not all_vids:
+            print("   • Warning: No ASR transcripts found to index.")
+            return
+
+        for vid in all_vids:
+            f_path = refined_files.get(vid) or raw_files.get(vid)
+            is_refined = vid in refined_files
             try:
-                with open(f, "r", encoding="utf-8") as fp:
-                    segs = json.load(fp)
-                if isinstance(segs, dict):
-                    segs = segs.get("segments", [])
-                for s in segs:
-                    raw_txt = s.get("cleaned_text", s.get("text", "")).strip()
-                    if not raw_txt:
-                        continue
+                with open(f_path, "r", encoding="utf-8") as fp:
+                    data = json.load(fp)
+
+                segments = []
+                if is_refined and isinstance(data, list):
+                    segments = data
+                elif isinstance(data, dict):
+                    segments = data.get("segments", [])
+                elif isinstance(data, list):
+                    segments = data
+
+                for s in segments:
                     st = float(s.get("start_sec", s.get("start", 0.0)))
                     et = float(s.get("end_sec", s.get("end", st + 1.0)))
-                    self.video_asr_timeline[vid].append((st, et, raw_txt))
-
-                    tokens = self.tokenize(raw_txt)
-                    if not tokens:
+                    txt = s.get("refined_text", s.get("cleaned_text", s.get("text", ""))).strip()
+                    if not txt:
                         continue
-                    
+
                     doc_idx = len(self.docs)
                     self.docs.append({
                         "video_id": vid,
-                        "scene_id": s.get("scene_id", ""),
                         "start_sec": st,
                         "end_sec": et,
-                        "text": raw_txt,
-                        "tokens": tokens
+                        "text": txt
                     })
+                    self.video_asr_timeline[vid].append((st, et, txt))
+
+                    tokens = self._tokenize(txt)
                     self.doc_len.append(len(tokens))
                     
-                    tf_counts = Counter(tokens)
-                    for t, tf in tf_counts.items():
-                        self.df[t] += 1
-                        self.inverted_index[t].append((doc_idx, tf))
+                    tf_counter = Counter(tokens)
+                    for term, tf in tf_counter.items():
+                        self.inverted_index[term].append((doc_idx, tf))
+                        self.df[term] += 1
+
             except Exception:
                 continue
 
-        # Sort timeline segments by start_sec for fast temporal queries
+        # Sort timeline segments for every video by timestamp
         for vid in self.video_asr_timeline:
             self.video_asr_timeline[vid].sort(key=lambda x: x[0])
 
         self.N = len(self.docs)
-        self.avgdl = sum(self.doc_len) / max(1, self.N)
-        print(f"   • BM25 indexed {self.N} speech segments across {len(files)} videos in {time.time()-t0:.2f}s.")
+        self.avgdl = sum(self.doc_len) / self.N if self.N > 0 else 0.0
+        print(f"   • BM25 indexed {self.N} speech segments across {len(all_vids)} videos in {time.time() - t0:.2f}s.")
 
-    @staticmethod
-    def tokenize(text: str) -> List[str]:
-        # Clean punctuation and split
-        cleaned = re.sub(r"[^\w\s]", " ", text.lower())
-        tokens = [t for t in cleaned.split() if len(t) > 1]
-        return tokens
+    def index_ocr(self, ocr_dir: str = "cache/ocr_text", fps: float = 25.0):
+        if not os.path.exists(ocr_dir):
+            return
+        t0 = time.time()
+        ocr_files = sorted(glob.glob(f"{ocr_dir}/*.json"))
+        if not ocr_files:
+            return
 
-    def search(self, query: str, top_k: int = 200) -> List[Tuple[int, float]]:
-        """
-        Returns list of (doc_idx, bm25_score) sorted descending.
-        """
-        raw_tokens = self.tokenize(query)
+        ocr_added = 0
+        for ocr_f in ocr_files:
+            vid = os.path.splitext(os.path.basename(ocr_f))[0]
+            try:
+                with open(ocr_f, "r", encoding="utf-8") as fp:
+                    ocr_data = json.load(fp)
+            except Exception:
+                continue
+            if not isinstance(ocr_data, dict):
+                continue
+
+            entries = []
+            for f_key, raw_text in ocr_data.items():
+                cleaned = str(raw_text).strip()
+                if not cleaned:
+                    continue
+                try:
+                    f_idx = int(str(f_key).replace("f_", ""))
+                    t_sec = f_idx / fps
+                except ValueError:
+                    t_sec = 0.0
+                entries.append((t_sec, cleaned))
+
+            entries.sort(key=lambda x: x[0])
+            if not entries:
+                continue
+
+            cur_text = entries[0][1]
+            cur_st = entries[0][0]
+            cur_et = entries[0][0] + 3.0
+            for t_sec, text in entries[1:]:
+                if text == cur_text and t_sec <= (cur_et + 3.0):
+                    cur_et = max(cur_et, t_sec + 3.0)
+                else:
+                    doc_idx = len(self.docs)
+                    self.docs.append({"video_id": vid, "start_sec": cur_st, "end_sec": cur_et, "text": cur_text, "source": "ocr"})
+                    tokens = self._tokenize(cur_text)
+                    self.doc_len.append(len(tokens))
+                    for term, tf in Counter(tokens).items():
+                        self.inverted_index[term].append((doc_idx, tf))
+                        self.df[term] += 1
+                    ocr_added += 1
+                    cur_text = text
+                    cur_st = t_sec
+                    cur_et = t_sec + 3.0
+
+            doc_idx = len(self.docs)
+            self.docs.append({"video_id": vid, "start_sec": cur_st, "end_sec": cur_et, "text": cur_text, "source": "ocr"})
+            tokens = self._tokenize(cur_text)
+            self.doc_len.append(len(tokens))
+            for term, tf in Counter(tokens).items():
+                self.inverted_index[term].append((doc_idx, tf))
+                self.df[term] += 1
+            ocr_added += 1
+
+        self.N = len(self.docs)
+        self.avgdl = sum(self.doc_len) / self.N if self.N > 0 else 0.0
+        print(f"   • BM25 indexed {ocr_added} merged OCR banner segments across {len(ocr_files)} videos in {time.time() - t0:.2f}s (Total Docs: {self.N}).")
+
+    def search(self, query: str, top_k: int = 300) -> List[Tuple[int, float]]:
+        if not query or self.N == 0:
+            return []
+
+        raw_tokens = self._tokenize(query)
+        if not raw_tokens:
+            return []
+
         # Separate meaningful tokens vs stopwords
         content_tokens = [t for t in raw_tokens if t not in VI_STOPWORDS]
         q_tokens = content_tokens if content_tokens else raw_tokens
@@ -121,6 +220,7 @@ class BM25Engine:
             return []
 
         scores = defaultdict(float)
+        avgdl = max(1e-6, self.avgdl)
         
         for qt in q_tokens:
             postings = self.inverted_index.get(qt)
@@ -132,7 +232,7 @@ class BM25Engine:
             
             for doc_idx, tf in postings:
                 dl = self.doc_len[doc_idx]
-                tf_norm = (tf * (self.k1 + 1.0)) / (tf + self.k1 * (1.0 - self.b + self.b * (dl / self.avgdl)))
+                tf_norm = (tf * (self.k1 + 1.0)) / (tf + self.k1 * (1.0 - self.b + self.b * (dl / avgdl)))
                 scores[doc_idx] += idf * tf_norm
 
         if not scores:
@@ -176,9 +276,36 @@ class SearchEngine:
 
         # 4. Build BM25 Inverted Index over Refined Speech Transcripts
         self.bm25 = BM25Engine()
-        self.bm25.index_transcripts("cache/asr_transcripts")
+        self.bm25.index_transcripts("cache/asr_transcripts_refined", "cache/asr_transcripts")
 
-        # 4b. Load OCR Data Index
+        # 4a. Load Dense Semantic Transcript Index (E5 / FAISS)
+        self.semantic_index = None
+        try:
+            self.semantic_index = TranscriptSemanticIndex().load_or_build()
+            self.semantic_index._get_encoder()
+            print(f"   • Loaded Dense Transcript Semantic Index ({len(self.semantic_index.segments_meta)} segments).")
+        except Exception as e:
+            print(f"   • Warning: Could not load TranscriptSemanticIndex: {e}")
+
+        # 4b. Load Neural Cross-Encoder Reranker (BGE-Reranker-v2-m3)
+        self.reranker = None
+        try:
+            self.reranker = BGEReranker(
+                model_name_or_path="BAAI/bge-reranker-v2-m3",
+                batch_size=32,
+                max_length=256
+            )
+            print("   • Loaded BGE-Reranker-v2-m3 Neural Cross-Encoder.")
+        except Exception as e:
+            print(f"   • Warning: Could not load BGEReranker: {e}")
+
+        # 4c. Load Transcript Context Expander & Deduplicator
+        self.context_expander = None
+        if self.semantic_index is not None and getattr(self.semantic_index, "segments_meta", None):
+            self.context_expander = TranscriptContextExpander(self.semantic_index.segments_meta)
+            print(f"   • Loaded Transcript Context Expander & Deduplicator ({len(self.semantic_index.segments_meta)} segments).")
+
+        # 4d. Load OCR Data Index
         self.ocr_dir = "cache/ocr_text"
         self.ocr_cache = {}
         if os.path.exists(self.ocr_dir):
@@ -190,14 +317,17 @@ class SearchEngine:
                 except Exception:
                     pass
         print(f"   • Loaded OCR annotations for {len(self.ocr_cache)} videos.")
+        self.bm25.index_ocr(self.ocr_dir)
 
         # 5. Load Models
-        self.encoder = CLIPTextEncoder(device="cuda" if cv2.cuda.getCudaEnabledDeviceCount() > 0 else "cpu")
+        self.encoder = CLIPTextEncoder(device="cuda" if torch.cuda.is_available() else "cpu")
         self.translator = QueryTranslator(use_online=True)
 
-        # 6. Thumbnail Cache
+        # 6. Thumbnail Memory + Disk Cache
         self.thumb_dir = "cache/thumbnails"
         os.makedirs(self.thumb_dir, exist_ok=True)
+        self.thumb_mem_cache: Dict[str, bytes] = {}
+        self.max_thumb_mem_cache = 4096
         
         print(f"✅ Search Engine ready in {time.time() - t0:.2f}s!")
 
@@ -205,6 +335,7 @@ class SearchEngine:
         """
         Retrieves the exact active speech transcript at pts_time, or nearest segment within max_dist_sec.
         """
+        video_id = sanitize_video_id(video_id)
         timeline = self.bm25.video_asr_timeline.get(video_id, [])
         if not timeline:
             return ""
@@ -234,29 +365,21 @@ class SearchEngine:
         """
         Extracts temporal speech transcripts (ASR) and on-screen OCR text around pts_time for video_id.
         """
-        # 1. ASR Segments
-        asr_file = os.path.join("cache/asr_transcripts", f"{video_id}.json")
+        video_id = sanitize_video_id(video_id)
+        if not video_id:
+            return {"video_id": "", "pts_time": pts_time, "asr_segments": [], "ocr_lines": []}
+
+        # 1. Fast In-Memory ASR Timeline Lookup
+        timeline = self.bm25.video_asr_timeline.get(video_id, [])
         segments = []
-        if os.path.exists(asr_file):
-            try:
-                with open(asr_file, "r", encoding="utf-8") as fp:
-                    raw_segs = json.load(fp)
-                    if isinstance(raw_segs, dict):
-                        raw_segs = raw_segs.get("segments", [])
-                    for s in raw_segs:
-                        st = float(s.get("start_sec", s.get("start", 0.0)))
-                        et = float(s.get("end_sec", s.get("end", st + 1.0)))
-                        txt = s.get("cleaned_text", s.get("text", "")).strip()
-                        if txt:
-                            is_near = (abs(st - pts_time) <= window_sec) or (abs(et - pts_time) <= window_sec) or (st <= pts_time <= et)
-                            segments.append({
-                                "start_sec": round(st, 2),
-                                "end_sec": round(et, 2),
-                                "text": txt,
-                                "is_near": is_near
-                            })
-            except Exception:
-                pass
+        for st, et, txt in timeline:
+            is_near = (abs(st - pts_time) <= window_sec) or (abs(et - pts_time) <= window_sec) or (st <= pts_time <= et)
+            segments.append({
+                "start_sec": round(st, 2),
+                "end_sec": round(et, 2),
+                "text": txt,
+                "is_near": is_near
+            })
 
         # 2. OCR Data
         ocr_data = self.ocr_cache.get(video_id, {})
@@ -372,6 +495,11 @@ class SearchEngine:
                 "error": "Thời gian Start hoặc End không đúng định dạng số giây."
             }
 
+        if not (math.isfinite(start_sec) and math.isfinite(end_sec)):
+            return {
+                "error": "Thời gian Start hoặc End không hợp lệ (NaN hoặc Infinity)."
+            }
+
         if start_sec < 0 or end_sec <= start_sec:
             return {
                 "error": f"Khoảng thời gian không hợp lệ: Start ({start_sec:.2f}s) phải nhỏ hơn End ({end_sec:.2f}s)."
@@ -384,10 +512,12 @@ class SearchEngine:
         if not final_key:
             if provider == "openai":
                 final_key = os.environ.get("OPENAI_API_KEY", "")
-            else:
+            elif provider == "openrouter":
                 final_key = os.environ.get("OPENROUTER_API_KEY", "")
+            else: # omniroute / default localhost proxy
+                final_key = os.environ.get("OMNIROUTE_API_KEY", os.environ.get("ANTHROPIC_AUTH_TOKEN", "omniroute"))
 
-        if not final_key and provider != "custom":
+        if not final_key and provider not in ("custom", "omniroute"):
             return {
                 "error": "API Key chưa được cấu hình. Vui lòng mở Cài đặt (⚙️) trên Chatbot để nhập API Key, hoặc cấu hình biến môi trường OPENROUTER_API_KEY / OPENAI_API_KEY trên server."
             }
@@ -396,12 +526,15 @@ class SearchEngine:
         if provider == "openai":
             api_url = "https://api.openai.com/v1/chat/completions"
             final_model = model.strip() if model.strip() else "gpt-4o-mini"
-        elif provider == "custom" and custom_url.strip():
-            api_url = custom_url.strip()
-            final_model = model.strip() if model.strip() else "gpt-4o-mini"
-        else: # openrouter
+        elif provider == "openrouter":
             api_url = "https://openrouter.ai/api/v1/chat/completions"
             final_model = model.strip() if model.strip() else os.environ.get("OPENROUTER_MODEL", "minimax/minimax-m3")
+        elif provider == "custom" and custom_url.strip():
+            api_url = custom_url.strip()
+            final_model = model.strip() if model.strip() else "antigravity/gemini-3.6-flash-medium"
+        else: # omniroute (default localhost proxy)
+            api_url = custom_url.strip() if (provider == "custom" and custom_url.strip()) else "http://localhost:20128/v1/chat/completions"
+            final_model = model.strip() if model.strip() else "antigravity/gemini-3.6-flash-medium"
 
         # 1. Extract Visual Frames for the Short Clip
         clip_frames = self.extract_clip_frames(video_id, start_sec, end_sec, num_frames=6)
@@ -427,6 +560,34 @@ class SearchEngine:
         ocr_str_list = [f"[{o['time_sec']}s]: {o['text']}" for o in used_ocr]
         ocr_context = "\n".join(ocr_str_list) if ocr_str_list else "(Không có chữ OCR trên màn hình trong đoạn clip này)"
 
+        # 3. Retrieve Top BGE Reranked Global Key Transcript Segments -> Expand with Neighbors & Deduplicate
+        rerank_context_block = ""
+        if query and self.semantic_index is not None and self.reranker is not None:
+            try:
+                raw_sem = self.semantic_index.query(query, top_k=30)
+                reranked_top = self.reranker.rerank(query, raw_sem, top_k=10)
+                if self.context_expander is not None:
+                    expanded_windows = self.context_expander.expand_and_deduplicate(
+                        reranked_top,
+                        neighbor_window=1,
+                        max_windows=3
+                    )
+                    formatted_ctx = self.context_expander.format_context_for_prompt(expanded_windows)
+                    if formatted_ctx:
+                        rerank_context_block = formatted_ctx + "\n\n"
+                elif reranked_top:
+                    rerank_lines = []
+                    for r_item in reranked_top[:5]:
+                        v = r_item.get("video_id", "")
+                        st_s = r_item.get("start_sec", 0.0)
+                        et_s = r_item.get("end_sec", 0.0)
+                        t = r_item.get("text", r_item.get("refined_text", ""))
+                        score = r_item.get("rerank_score", 0.0)
+                        rerank_lines.append(f"- [{v} | {st_s:.1f}s - {et_s:.1f}s] (Độ khớp BGE: {score:.3f}): \"{t}\"")
+                    rerank_context_block = f"[CÁC ĐOẠN LỜI THOẠI TRỌNG TÂM KHỚP NHẤT TỪ BGE-RERANKER]:\n" + "\n".join(rerank_lines) + "\n\n"
+            except Exception:
+                pass
+
         system_prompt = (
             "Bạn là Trợ lý VLM (Vision-Language Model) chuyên gia phân tích video cho Hệ thống Truy vấn AIC 2026.\n"
             "Người dùng đã cắt và đánh dấu một ĐOẠN CLIP VIDEO NGẮN cụ thể để đặt câu hỏi.\n\n"
@@ -438,6 +599,7 @@ class SearchEngine:
             f"- Số khung hình hình ảnh VLM nhận được từ clip: {len(clip_frames)} frames\n\n"
             f"[LỜI THOẠI BĂNG GHI ÂM (ASR) TRONG ĐOẠN CLIP]:\n{asr_context}\n\n"
             f"[CHỮ HIỂN THỊ TRÊN MÀN HÌNH / BANNER (OCR) TRONG ĐOẠN CLIP]:\n{ocr_context}\n\n"
+            f"{rerank_context_block}"
             "HƯỚNG DẪN TRẢ LỜI CHO VLM:\n"
             "1. Kết hợp chặt chẽ giữa HÌNH ẢNH TRỰC QUAN (các frames được cung cấp trong clip) và LỜI THOẠI ASR + CHỮ OCR để trả lời chính xác, súc tích.\n"
             "2. Tập trung phân tích hành động, diễn biến, nhân vật, đồ vật, chữ hiển thị, hoặc sự kiện diễn ra cụ thể trong đoạn clip [start, end].\n"
@@ -480,16 +642,44 @@ class SearchEngine:
         body = {
             "model": final_model,
             "messages": formatted_messages,
-            "temperature": 0.3
+            "temperature": 0.3,
+            "stream": False
         }
 
         try:
             req = urllib.request.Request(api_url, data=json.dumps(body).encode("utf-8"), headers=headers)
             with urllib.request.urlopen(req, timeout=60) as resp:
-                resp_data = json.loads(resp.read().decode("utf-8"))
-                choices = resp_data.get("choices", [])
-                if choices:
-                    reply_text = choices[0].get("message", {}).get("content", "")
+                raw_text = resp.read().decode("utf-8")
+                reply_text = ""
+
+                # 1. Try parsing standard OpenAI JSON response
+                if not raw_text.strip().startswith("data:"):
+                    try:
+                        resp_data = json.loads(raw_text)
+                        choices = resp_data.get("choices", [])
+                        if choices:
+                            reply_text = choices[0].get("message", {}).get("content", "")
+                    except Exception:
+                        pass
+
+                # 2. Fallback to parsing Server-Sent Events (SSE) streaming format if stream was returned
+                if not reply_text and "data:" in raw_text:
+                    stream_chunks = []
+                    for line in raw_text.splitlines():
+                        line = line.strip()
+                        if line.startswith("data:") and not line.endswith("[DONE]"):
+                            chunk_json = line[5:].strip()
+                            try:
+                                chunk_obj = json.loads(chunk_json)
+                                delta = chunk_obj.get("choices", [{}])[0].get("delta", {})
+                                content_piece = delta.get("content", "")
+                                if content_piece:
+                                    stream_chunks.append(content_piece)
+                            except Exception:
+                                pass
+                    reply_text = "".join(stream_chunks).strip()
+
+                if reply_text:
                     return {
                         "reply": reply_text,
                         "video_id": video_id,
@@ -503,7 +693,7 @@ class SearchEngine:
                         "ocr_count": len(used_ocr)
                     }
                 else:
-                    return {"error": "API did not return any choices."}
+                    return {"error": "API did not return any choices or content."}
         except urllib.error.HTTPError as e:
             try:
                 err_detail = e.read().decode("utf-8")
@@ -516,10 +706,24 @@ class SearchEngine:
             return {"error": f"Failed to connect to VLM API: {str(e)}"}
 
     def extract_thumbnail(self, video_id: str, frame_idx: int) -> Optional[bytes]:
-        thumb_path = os.path.join(self.thumb_dir, f"{video_id}_{frame_idx}.jpg")
+        video_id = sanitize_video_id(video_id)
+        if not video_id:
+            return None
+
+        cache_key = f"{video_id}_{frame_idx}"
+        if cache_key in self.thumb_mem_cache:
+            return self.thumb_mem_cache[cache_key]
+
+        thumb_path = os.path.join(self.thumb_dir, f"{cache_key}.jpg")
         if os.path.exists(thumb_path):
-            with open(thumb_path, "rb") as f:
-                return f.read()
+            try:
+                with open(thumb_path, "rb") as f:
+                    data = f.read()
+                    if len(self.thumb_mem_cache) < self.max_thumb_mem_cache:
+                        self.thumb_mem_cache[cache_key] = data
+                    return data
+            except Exception:
+                pass
 
         vid_path = self.video_paths.get(video_id)
         if not vid_path or not os.path.exists(vid_path):
@@ -527,6 +731,7 @@ class SearchEngine:
 
         cap = cv2.VideoCapture(vid_path)
         if not cap.isOpened():
+            cap.release()
             return None
 
         try:
@@ -543,8 +748,19 @@ class SearchEngine:
             success, enc_jpg = cv2.imencode(".jpg", resized, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
             if success:
                 jpg_bytes = enc_jpg.tobytes()
-                with open(thumb_path, "wb") as f:
-                    f.write(jpg_bytes)
+                # Store in memory cache
+                if len(self.thumb_mem_cache) < self.max_thumb_mem_cache:
+                    self.thumb_mem_cache[cache_key] = jpg_bytes
+                
+                # Atomic file write to avoid multi-thread collision
+                tmp_path = f"{thumb_path}.{os.getpid()}.{time.time_ns()}.tmp"
+                try:
+                    with open(tmp_path, "wb") as f:
+                        f.write(jpg_bytes)
+                    os.replace(tmp_path, thumb_path)
+                except Exception:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
                 return jpg_bytes
         finally:
             cap.release()
@@ -621,82 +837,36 @@ class SearchEngine:
 
         return total_kw_score
 
-    def search(
+    def _apply_temporal_nms(
         self,
-        query: str,
-        keywords: Optional[List[Dict]] = None,
-        w_dense: float = 0.50,
-        w_asr: float = 0.50,
-        top_k: int = 100
-    ) -> Dict:
-        t0 = time.time()
-        query = query.strip()
-        if not query:
-            return {"translated_query": "", "search_time_ms": 0, "results": []}
-
-        # --- A. Dense Visual Search (CLIP) ---
-        en_query = self.translator.translate(query)
-        prompts = self.translator.generate_prompts(en_query)
-        q_vec = self.encoder.encode_text(prompts, ensemble=True)
-        dense_scores = np.dot(self.matrix, q_vec)  # (177321,)
-
-        # Normalize dense scores to [0, 1]
-        d_min, d_max = float(np.min(dense_scores)), float(np.max(dense_scores))
-        d_denom = max(1e-6, d_max - d_min)
-        norm_dense_scores = (dense_scores - d_min) / d_denom
-
-        # --- B. BM25 Text Search (Full Corpus) ---
-        bm25_hits = self.bm25.search(query, top_k=300)
-        
-        # Aggregate BM25 scores to keyframes by video and timestamp
-        keyframe_asr_scores = np.zeros(len(self.records), dtype=np.float32)
-        keyframe_asr_texts = {}
-
-        if bm25_hits:
-            max_bm25 = max(score for _, score in bm25_hits)
-            for doc_idx, b_score in bm25_hits:
-                doc = self.bm25.docs[doc_idx]
-                vid = doc["video_id"]
-                st = doc["start_sec"]
-                et = doc["end_sec"]
-                txt = doc["text"]
-                norm_b = b_score / max(1e-6, max_bm25)
-
-                # Assign boost to all keyframes belonging to this video within [st-3s, et+3s]
-                kf_indices = self.video_to_records.get(vid, [])
-                for k_idx in kf_indices:
-                    pts = self.records[k_idx]["pts_time"]
-                    if (st - 3.0) <= pts <= (et + 3.0):
-                        if norm_b > keyframe_asr_scores[k_idx]:
-                            keyframe_asr_scores[k_idx] = norm_b
-                            keyframe_asr_texts[k_idx] = txt
-
-        # --- C. Multi-Modal Fusion ---
-        fused_scores = (w_dense * norm_dense_scores) + (w_asr * keyframe_asr_scores)
-        if keywords:
-            fused_scores += self._compute_keyword_scores(keywords, w_dense, w_asr, keyframe_asr_texts)
-
-        # Get top-K candidate indices
-        k_pool = min(top_k * 4, len(self.records))
-        top_indices = np.argpartition(fused_scores, -k_pool)[-k_pool:]
-        top_indices = top_indices[np.argsort(fused_scores[top_indices])[::-1]]
-
-        # Diversity / Non-Maximum Suppression (deduplicate within ±2 seconds in same video)
+        top_indices: np.ndarray,
+        top_k: int,
+        initial_candidates: Optional[List[int]] = None,
+        window_sec: float = 2.0
+    ) -> List[int]:
+        """
+        Deduplicates keyframe candidates belonging to the same video within +/- window_sec.
+        """
         seen_timestamps = defaultdict(list)
-        final_candidates = []
+        final_candidates: List[int] = []
+
+        if initial_candidates:
+            for idx in initial_candidates:
+                if idx not in final_candidates:
+                    rec = self.records[idx]
+                    vid = rec["video_id"]
+                    pts = rec["pts_time"]
+                    seen_timestamps[vid].append(pts)
+                    final_candidates.append(idx)
 
         for idx in top_indices:
+            if idx in final_candidates:
+                continue
             rec = self.records[idx]
             vid = rec["video_id"]
             pts = rec["pts_time"]
             
-            # Check if this frame is too close to an already selected frame in the same video
-            is_dup = False
-            for prev_pts in seen_timestamps[vid]:
-                if abs(pts - prev_pts) < 2.0:
-                    is_dup = True
-                    break
-            
+            is_dup = any(abs(pts - prev_pts) < window_sec for prev_pts in seen_timestamps[vid])
             if is_dup and len(final_candidates) < top_k:
                 continue
 
@@ -704,6 +874,217 @@ class SearchEngine:
             final_candidates.append(idx)
             if len(final_candidates) >= top_k:
                 break
+
+        return final_candidates
+
+    def _decompose_query_subscenes(self, query: str) -> List[str]:
+        """
+        Extracts individual chronological scene descriptions from a complex multi-event prompt.
+        """
+        split_pattern = r"[.\n;]|(?:\b(?:sau đó|tiếp theo|tiếp đến|kế tiếp|bắt đầu bằng|rồi đến|kết thúc bằng|sau cùng|then|after that|followed by|next)\b)"
+        raw_parts = [p.strip() for p in re.split(split_pattern, query, flags=re.IGNORECASE)]
+        clean_parts = []
+        stop_phrases = {"đoạn phim", "video", "cảnh quay", "clip", "hình ảnh", "bộ phim", "đoạn video", "đoạn clip"}
+        for p in raw_parts:
+            p_clean = re.sub(r"^[,:;\-\s]+|[,:;\-\s]+$", "", p).strip()
+            if len(p_clean) >= 12 and p_clean.lower() not in stop_phrases:
+                clean_parts.append(p_clean)
+        return clean_parts
+
+    def search(
+        self,
+        query: str,
+        keywords: Optional[List[Dict]] = None,
+        w_dense: float = 0.50,
+        w_asr: float = 0.50,
+        top_k: int = 100,
+        asr_window_sec: float = 5.0
+    ) -> Dict:
+        t0 = time.time()
+        query = query.strip()
+        if not query:
+            return {"translated_query": "", "search_time_ms": 0, "total_results": 0, "results": []}
+
+        # Validate and clamp numeric parameters
+        try:
+            top_k = max(1, min(1000, int(top_k)))
+        except (ValueError, TypeError):
+            top_k = 100
+
+        try:
+            w_dense = float(w_dense)
+            if not math.isfinite(w_dense):
+                w_dense = 0.50
+        except (ValueError, TypeError):
+            w_dense = 0.50
+
+        try:
+            w_asr = float(w_asr)
+            if not math.isfinite(w_asr):
+                w_asr = 0.50
+        except (ValueError, TypeError):
+            w_asr = 0.50
+
+        try:
+            asr_window_sec = max(0.5, min(30.0, float(asr_window_sec)))
+        except (ValueError, TypeError):
+            asr_window_sec = 5.0
+
+        # --- A. Dense Visual Search (CLIP Multi-Scene + Holistic) ---
+        en_query = self.translator.translate(query)
+        prompts = self.translator.generate_prompts(en_query)
+        q_vec = self.encoder.encode_text(prompts, ensemble=True)
+        dense_scores_whole = np.dot(self.matrix, q_vec)  # (177321,)
+
+        sub_clauses = self._decompose_query_subscenes(query)
+        best_sub_idx = None
+
+        if len(sub_clauses) > 1:
+            sub_vectors = []
+            for sc in sub_clauses:
+                en_sc = self.translator.translate(sc)
+                prompts_sc = self.translator.generate_prompts(en_sc)
+                sub_vectors.append(self.encoder.encode_text(prompts_sc, ensemble=True))
+
+            sub_matrix = np.column_stack(sub_vectors)
+            sub_scores_raw = np.dot(self.matrix, sub_matrix)
+
+            # 1. Absolute-Weighted Min-Max Calibration
+            sub_scores_norm = np.zeros_like(sub_scores_raw)
+            for c in range(sub_scores_raw.shape[1]):
+                col = sub_scores_raw[:, c]
+                c_min, c_max = float(np.min(col)), float(np.max(col))
+                col_norm = (col - c_min) / max(1e-6, c_max - c_min)
+                # Scale by absolute peak confidence to prevent irrelevant sub-scenes from becoming 1.0
+                col_conf = float(np.clip((c_max - 0.20) / 0.13, 0.15, 1.0))
+                sub_scores_norm[:, c] = col_norm * col_conf
+
+            w_min, w_max = float(np.min(dense_scores_whole)), float(np.max(dense_scores_whole))
+            norm_whole = (dense_scores_whole - w_min) / max(1e-6, w_max - w_min)
+            whole_conf = float(np.clip((w_max - 0.20) / 0.13, 0.15, 1.0))
+            norm_whole = norm_whole * whole_conf
+
+            # 2. Sub-scene Pooling: 0.70 * max + 0.30 * top-2 mean
+            if sub_scores_norm.shape[1] >= 2:
+                top2_vals = np.partition(sub_scores_norm, -2, axis=1)[:, -2:]
+                top2_mean = np.mean(top2_vals, axis=1)
+                max_sub_pooled = (0.70 * np.max(sub_scores_norm, axis=1)) + (0.30 * top2_mean)
+            else:
+                max_sub_pooled = np.max(sub_scores_norm, axis=1)
+
+            best_sub_idx = np.argmax(sub_scores_norm, axis=1)
+            norm_dense_scores = (0.35 * norm_whole) + (0.65 * max_sub_pooled)
+            dense_scores = (0.35 * dense_scores_whole) + (0.65 * np.max(sub_scores_raw, axis=1))
+        else:
+            d_min, d_max = float(np.min(dense_scores_whole)), float(np.max(dense_scores_whole))
+            d_denom = max(1e-6, d_max - d_min)
+            col_norm = (dense_scores_whole - d_min) / d_denom
+            # Absolute confidence weighting on visual CLIP
+            d_conf = float(np.clip((d_max - 0.20) / 0.13, 0.15, 1.0))
+            norm_dense_scores = col_norm * d_conf
+            dense_scores = dense_scores_whole
+
+        # --- B. Speech Transcript Search (BM25 Lexical + E5 Semantic) ---
+        bm25_hits = self.bm25.search(query, top_k=300)
+        sem_hits = []
+        if self.semantic_index is not None:
+            try:
+                sem_hits = self.semantic_index.query(query, top_k=300)
+            except Exception:
+                sem_hits = []
+        
+        # Aggregate BM25 & Semantic scores to keyframes by video and timestamp
+        keyframe_asr_scores = np.zeros(len(self.records), dtype=np.float32)
+        keyframe_asr_texts = {}
+
+        if bm25_hits:
+            for doc_idx, b_score in bm25_hits:
+                doc = self.bm25.docs[doc_idx]
+                vid = doc["video_id"]
+                st = doc["start_sec"]
+                et = doc["end_sec"]
+                txt = doc["text"]
+                # Sigmoidal absolute BM25 calibration: BM25 / (25.0 + BM25)
+                norm_b = float(b_score) / (25.0 + float(b_score))
+
+                # Assign boost to all keyframes belonging to this video within [st - asr_window_sec, et + asr_window_sec]
+                kf_indices = self.video_to_records.get(vid, [])
+                for k_idx in kf_indices:
+                    pts = self.records[k_idx]["pts_time"]
+                    if (st - asr_window_sec) <= pts <= (et + asr_window_sec):
+                        if norm_b > keyframe_asr_scores[k_idx]:
+                            keyframe_asr_scores[k_idx] = norm_b
+                            keyframe_asr_texts[k_idx] = txt
+
+        if sem_hits:
+            if self.reranker is not None:
+                # 1. Rerank Top 30 dense semantic candidates with BGE-Reranker-v2-m3
+                top_dense_candidates = sem_hits[:30]
+                reranked_candidate_dicts = self.reranker.rerank(
+                    query=query,
+                    candidates=top_dense_candidates,
+                    top_k=min(30, len(top_dense_candidates))
+                )
+                
+                # 2. Expand neighboring segment context for temporal completeness
+                expanded_candidates = self.context_expander.expand_and_deduplicate(
+                    ranked_candidates=reranked_candidate_dicts,
+                    neighbor_window=1,
+                    max_windows=15
+                )
+                
+                if expanded_candidates:
+                    for cand in expanded_candidates:
+                        vid = cand["video_id"]
+                        st = cand["start_sec"]
+                        et = cand["end_sec"]
+                        txt = cand.get("text", "")
+                        raw_s = cand.get("rerank_score", cand.get("score", 0.0))
+                        # Absolute E5 / BGE rerank score calibration
+                        if "rerank_score" in cand:
+                            # BGE logits passed through sigmoid
+                            norm_s = 1.0 / (1.0 + math.exp(-float(raw_s)))
+                        else:
+                            # E5 cosine similarity mapped from [0.70, 0.90] -> [0.0, 1.0]
+                            norm_s = float(np.clip((raw_s - 0.70) / 0.20, 0.0, 1.0))
+                        
+                        kf_indices = self.video_to_records.get(vid, [])
+                        for k_idx in kf_indices:
+                            pts = self.records[k_idx]["pts_time"]
+                            if (st - asr_window_sec) <= pts <= (et + asr_window_sec):
+                                if norm_s > keyframe_asr_scores[k_idx]:
+                                    keyframe_asr_scores[k_idx] = norm_s
+                                    if not keyframe_asr_texts.get(k_idx):
+                                        keyframe_asr_texts[k_idx] = txt
+            else:
+                for cand_dict, s_score in sem_hits:
+                    vid = cand_dict["video_id"]
+                    st = cand_dict["start_sec"]
+                    et = cand_dict["end_sec"]
+                    txt = cand_dict.get("text", "")
+                    norm_s = float(np.clip((s_score - 0.70) / 0.20, 0.0, 1.0))
+
+                    kf_indices = self.video_to_records.get(vid, [])
+                    for k_idx in kf_indices:
+                        pts = self.records[k_idx]["pts_time"]
+                        if (st - asr_window_sec) <= pts <= (et + asr_window_sec):
+                            if norm_s > keyframe_asr_scores[k_idx]:
+                                keyframe_asr_scores[k_idx] = norm_s
+                                if not keyframe_asr_texts.get(k_idx):
+                                    keyframe_asr_texts[k_idx] = txt
+
+        # --- C. Multi-Modal Fusion ---
+        fused_scores = (w_dense * norm_dense_scores) + (w_asr * keyframe_asr_scores)
+        if keywords:
+            fused_scores += self._compute_keyword_scores(keywords, w_dense, w_asr, keyframe_asr_texts)
+
+        # Get top-K candidate indices with safe bounds
+        k_pool = min(max(top_k * 4, 1), len(self.records))
+        top_indices = np.argpartition(fused_scores, -k_pool)[-k_pool:]
+        top_indices = top_indices[np.argsort(fused_scores[top_indices])[::-1]]
+
+        # Diversity / Non-Maximum Suppression (deduplicate within ±2 seconds in same video)
+        final_candidates = self._apply_temporal_nms(top_indices, top_k=top_k, window_sec=2.0)
 
         # Build output response list
         results = []
@@ -718,15 +1099,23 @@ class SearchEngine:
             if not asr_text:
                 asr_text = self.get_asr_at_pts(vid, pts)
 
+            matched_scene = ""
+            if best_sub_idx is not None and len(sub_clauses) > 1:
+                matched_scene = sub_clauses[best_sub_idx[idx]]
+
             results.append({
                 "rank": rank,
                 "video_id": vid,
                 "frame_idx": f_idx,
                 "fps": fps,
                 "pts_time": round(pts, 4),
-                "dense_score": round(float(dense_scores[idx]), 4),
+                "raw_dense_score": round(float(dense_scores_whole[idx]), 4),
+                "norm_dense_score": round(float(norm_dense_scores[idx]), 4),
+                "raw_asr_score": round(float(keyframe_asr_scores[idx]), 4),
+                "retrieval_score": round(float(fused_scores[idx]), 4),
                 "score": round(float(fused_scores[idx]), 4),
                 "matched_asr": asr_text,
+                "matched_scene": matched_scene,
                 "thumb_url": f"/api/frame?video_id={vid}&frame_idx={f_idx}",
                 "video_url": f"/api/video?video_id={vid}"
             })
@@ -735,6 +1124,8 @@ class SearchEngine:
         return {
             "query_vi": query,
             "translated_query": en_query,
+            "sub_scenes": sub_clauses if len(sub_clauses) > 1 else [],
+            "asr_window_sec": asr_window_sec,
             "search_time_ms": search_time_ms,
             "total_results": len(results),
             "results": results
@@ -749,12 +1140,38 @@ class SearchEngine:
         w_asr: float = 0.50,
         top_k: int = 100,
         alpha: float = 0.65,
-        beta: float = 0.35
+        beta: float = 0.35,
+        asr_window_sec: float = 5.0
     ) -> Dict:
         t0 = time.time()
         query = query.strip()
         if not query and not marked_items:
             return {"query_vi": "", "translated_query": "", "search_time_ms": 0, "total_results": 0, "results": []}
+
+        # Validate and clamp numeric parameters
+        try:
+            top_k = max(1, min(1000, int(top_k)))
+        except (ValueError, TypeError):
+            top_k = 100
+
+        try:
+            w_dense = float(w_dense)
+            if not math.isfinite(w_dense):
+                w_dense = 0.50
+        except (ValueError, TypeError):
+            w_dense = 0.50
+
+        try:
+            w_asr = float(w_asr)
+            if not math.isfinite(w_asr):
+                w_asr = 0.50
+        except (ValueError, TypeError):
+            w_asr = 0.50
+
+        try:
+            asr_window_sec = max(0.5, min(30.0, float(asr_window_sec)))
+        except (ValueError, TypeError):
+            asr_window_sec = 5.0
 
         # 1. Base Text Embedding
         en_query = self.translator.translate(query) if query else ""
@@ -767,9 +1184,16 @@ class SearchEngine:
         # 2. Positive Feedback Indices
         pos_indices = []
         for m in marked_items:
-            vid = m.get("video_id")
-            fid = int(m.get("frame_idx", 0))
-            target_pts = float(m.get("pts_time", 0.0))
+            vid = sanitize_video_id(m.get("video_id"))
+            try:
+                fid = int(m.get("frame_idx", 0))
+            except (ValueError, TypeError):
+                fid = 0
+            try:
+                target_pts = float(m.get("pts_time", 0.0))
+            except (ValueError, TypeError):
+                target_pts = 0.0
+
             key = (vid, fid)
             if key in self.frame_lookup:
                 pos_indices.append(self.frame_lookup[key])
@@ -804,8 +1228,12 @@ class SearchEngine:
         # 4. Temporal Proximity Bonus for Confirmed Scenes
         scene_mod = np.zeros(len(self.records), dtype=np.float32)
         for m in marked_items:
-            vid = m.get("video_id")
-            target_pts = float(m.get("pts_time", 0.0))
+            vid = sanitize_video_id(m.get("video_id"))
+            try:
+                target_pts = float(m.get("pts_time", 0.0))
+            except (ValueError, TypeError):
+                target_pts = 0.0
+
             if vid in self.video_to_records:
                 for k_idx in self.video_to_records[vid]:
                     rec = self.records[k_idx]
@@ -818,7 +1246,7 @@ class SearchEngine:
 
         norm_dense_scores = np.clip(norm_dense_scores + scene_mod, 0.0, 1.0)
 
-        # 4. BM25 Speech Retrieval
+        # 5. BM25 Speech Retrieval
         keyframe_asr_scores = np.zeros(len(self.records), dtype=np.float32)
         keyframe_asr_texts = {}
         if query:
@@ -835,46 +1263,28 @@ class SearchEngine:
                     kf_indices = self.video_to_records.get(vid, [])
                     for k_idx in kf_indices:
                         pts = self.records[k_idx]["pts_time"]
-                        if (st - 3.0) <= pts <= (et + 3.0):
+                        if (st - asr_window_sec) <= pts <= (et + asr_window_sec):
                             if norm_b > keyframe_asr_scores[k_idx]:
                                 keyframe_asr_scores[k_idx] = norm_b
                                 keyframe_asr_texts[k_idx] = txt
 
-        # 5. Fusion & NMS
+        # 6. Fusion & NMS
         fused_scores = (w_dense * norm_dense_scores) + (w_asr * keyframe_asr_scores)
         if keywords:
             fused_scores += self._compute_keyword_scores(keywords, w_dense, w_asr, keyframe_asr_texts)
-        k_pool = min(top_k * 4, len(self.records))
+
+        k_pool = min(max(top_k * 4, 1), len(self.records))
         top_indices = np.argpartition(fused_scores, -k_pool)[-k_pool:]
         top_indices = top_indices[np.argsort(fused_scores[top_indices])[::-1]]
 
-        seen_timestamps = defaultdict(list)
-        final_candidates = []
+        final_candidates = self._apply_temporal_nms(
+            top_indices,
+            top_k=top_k,
+            initial_candidates=pos_indices,
+            window_sec=2.0
+        )
 
-        # 1. Place marked correct keyframes at the very top (Rank 1, 2, ...)
-        for idx in pos_indices:
-            if idx not in final_candidates:
-                rec = self.records[idx]
-                vid = rec["video_id"]
-                pts = rec["pts_time"]
-                seen_timestamps[vid].append(pts)
-                final_candidates.append(idx)
-
-        # 2. Fill remaining top candidates via NMS
-        for idx in top_indices:
-            if idx in final_candidates:
-                continue
-            rec = self.records[idx]
-            vid = rec["video_id"]
-            pts = rec["pts_time"]
-            is_dup = any(abs(pts - prev_pts) < 2.0 for prev_pts in seen_timestamps[vid])
-            if is_dup and len(final_candidates) < top_k:
-                continue
-            seen_timestamps[vid].append(pts)
-            final_candidates.append(idx)
-            if len(final_candidates) >= top_k:
-                break
-
+        sub_clauses = self._decompose_query_subscenes(query) if query else []
         pos_set = set(pos_indices)
         results = []
         for rank, idx in enumerate(final_candidates, start=1):
@@ -888,15 +1298,21 @@ class SearchEngine:
             if not asr_text:
                 asr_text = self.get_asr_at_pts(vid, pts)
 
+            matched_scene = ""
+
             results.append({
                 "rank": rank,
                 "video_id": vid,
                 "frame_idx": f_idx,
                 "fps": fps,
                 "pts_time": round(pts, 4),
-                "dense_score": 1.0 if idx in pos_set else round(float(dense_scores[idx]), 4),
+                "raw_dense_score": round(float(dense_scores[idx]), 4),
+                "norm_dense_score": round(float(norm_dense_scores[idx]), 4),
+                "raw_asr_score": round(float(keyframe_asr_scores[idx]), 4),
+                "retrieval_score": round(float(fused_scores[idx]), 4),
                 "score": score_val,
                 "matched_asr": asr_text,
+                "matched_scene": matched_scene,
                 "thumb_url": f"/api/frame?video_id={vid}&frame_idx={f_idx}",
                 "video_url": f"/api/video?video_id={vid}"
             })
@@ -1021,7 +1437,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="flex-1 w-full max-w-[1720px] mx-auto p-4 md:p-6 flex flex-col md:flex-row gap-6 items-start">
 
     <!-- Persistent Left Queries Sidebar (Always Visible) -->
-    <aside id="querySidebar" class="w-full md:w-80 lg:w-[370px] flex-shrink-0 bg-[#080b14]/95 backdrop-blur-xl rounded-2xl p-4 shadow-2xl border border-slate-800/80 flex flex-col gap-3.5 md:sticky md:top-20 max-h-[calc(100vh-6rem)] overflow-hidden z-30 relative">
+    <aside id="querySidebar" class="w-full md:w-80 lg:w-[370px] flex-shrink-0 bg-[#080b14]/95 backdrop-blur-xl rounded-2xl p-4 shadow-2xl border border-slate-800/80 flex flex-col gap-3.5 md:sticky md:top-20 max-h-[calc(100vh-6rem)] overflow-hidden z-50 relative">
       
       <!-- Sidebar Header -->
       <div class="flex items-center justify-between border-b border-slate-800/70 pb-3">
@@ -1293,7 +1709,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
   <!-- Video Inspection Modal (Non-blocking: Queries Sidebar stays visible on the left) -->
-  <div id="detailModal" class="fixed inset-0 z-40 bg-slate-950/75 backdrop-blur-sm hidden flex items-center justify-center md:pl-80 lg:pl-96 p-2 md:p-6 overflow-y-auto">
+  <div id="detailModal" onclick="if(event.target === this) closeModal()" class="fixed inset-0 z-40 bg-black/40 hidden flex items-center justify-center md:pl-80 lg:pl-96 p-2 md:p-6 overflow-y-auto">
     <div class="glass max-w-4xl w-full rounded-2xl overflow-hidden shadow-2xl border border-slate-700 flex flex-col max-h-[92vh]">
       
       <!-- Modal Header -->
@@ -1306,15 +1722,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- Modal Body -->
-      <div class="p-5 flex flex-col gap-4 overflow-y-auto">
+      <div class="p-3.5 flex flex-col gap-2.5 overflow-y-auto">
         
-        <!-- Video Player Element -->
-        <div class="relative aspect-video bg-black rounded-xl overflow-hidden shadow-2xl border border-slate-800">
-          <video id="mainVideoPlayer" controls autoplay class="w-full h-full object-contain"></video>
+        <!-- Video Player Element (Compact 36vh Fit - Keeps TRAKE and Controls Fully Visible) -->
+        <div class="w-full max-w-[680px] mx-auto flex items-center justify-center bg-slate-950/90 rounded-xl border border-slate-800/80 p-1">
+          <video id="mainVideoPlayer" controls autoplay playsinline class="w-full max-h-[36vh] object-contain rounded-lg block shadow-lg"></video>
         </div>
 
         <!-- Video Player Fast Seeking & Controls -->
-        <div class="flex flex-wrap items-center justify-between gap-3 bg-slate-900/80 p-3 rounded-xl border border-slate-800 text-xs">
+        <div class="flex flex-wrap items-center justify-between gap-2 bg-slate-900/80 p-2 rounded-xl border border-slate-800 text-xs">
           <div class="flex items-center gap-2">
             <button onclick="seekRel(-5)" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 rounded text-slate-200 font-medium">⏪ -5s</button>
             <button onclick="seekRel(-1)" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 rounded text-slate-200 font-medium">⏮ -1s</button>
@@ -1347,34 +1763,34 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
 
         <!-- Metadata & Live Frame Tracker -->
-        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
-          <div class="bg-slate-900 p-2.5 rounded-lg border border-slate-800">
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+          <div class="bg-slate-900 p-2 rounded-lg border border-slate-800">
             <span class="text-slate-500 font-semibold block mb-0.5 text-[10px]">VIDEO ID</span>
             <span id="modalVideo" class="text-emerald-400 font-mono text-xs font-bold truncate block"></span>
           </div>
-          <div class="bg-slate-900 p-2.5 rounded-lg border border-slate-800">
+          <div class="bg-slate-900 p-2 rounded-lg border border-slate-800">
             <span class="text-slate-500 font-semibold block mb-0.5 text-[10px]">CANDIDATE FRAME</span>
             <span id="modalCandidateFrame" class="text-slate-200 font-mono text-xs truncate block"></span>
           </div>
-          <div class="bg-slate-900 p-2.5 rounded-lg border border-slate-800">
+          <div class="bg-slate-900 p-2 rounded-lg border border-slate-800">
             <span class="text-slate-500 font-semibold block mb-0.5 text-[10px]">PLAYING FRAME</span>
             <span id="modalCurrentFrame" class="text-amber-300 font-mono text-xs font-bold block">0 (00:00)</span>
           </div>
-          <div class="bg-slate-900 p-2.5 rounded-lg border border-slate-800">
+          <div class="bg-slate-900 p-2 rounded-lg border border-slate-800">
             <span class="text-slate-500 font-semibold block mb-0.5 text-[10px]">MATCH STATUS</span>
             <span id="modalPinnedStatus" class="text-slate-400 font-mono text-xs block">Not Pinned</span>
           </div>
         </div>
 
         <!-- Refined Speech Dialogue -->
-        <div class="bg-slate-900 p-3.5 rounded-lg border border-slate-800 flex flex-col gap-1.5">
+        <div class="bg-slate-900 p-2.5 rounded-lg border border-slate-800 flex flex-col gap-1">
           <span class="text-slate-400 text-xs font-semibold">🎙️ REFINED SPEECH DIALOGUE (BM25 MATCH)</span>
           <p id="modalASR" class="text-xs text-slate-200 italic leading-relaxed"></p>
         </div>
 
         <!-- Mode-Specific UI in Modal -->
         <!-- 1. Q&A Answer Section (Active in Q&A Mode) -->
-        <div id="modalQABox" class="bg-slate-900 p-3.5 rounded-xl border border-amber-500/30 flex flex-col gap-2">
+        <div id="modalQABox" class="bg-slate-900 p-2.5 rounded-xl border border-amber-500/30 flex flex-col gap-2">
           <div class="flex items-center justify-between text-xs">
             <span class="text-amber-400 font-bold flex items-center gap-1.5">
               💬 Q&A Answer (Câu trả lời cho Video này):
@@ -1390,7 +1806,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
 
         <!-- 2. TRAKE Event Sequence Section (Active in TRAKE Mode) -->
-        <div id="modalTrakeBox" class="bg-slate-900 p-3.5 rounded-xl border border-indigo-500/40 flex flex-col gap-2.5">
+        <div id="modalTrakeBox" class="bg-slate-900 p-2.5 rounded-xl border border-indigo-500/40 flex flex-col gap-2">
           <div class="flex items-center justify-between text-xs">
             <div class="flex items-center gap-1.5">
               <span class="text-indigo-400 font-bold flex items-center gap-1">⏱️ TRAKE Event Sequence:</span>
@@ -1457,7 +1873,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <span class="text-xl">🤖</span>
       <div class="flex flex-col text-left leading-tight">
         <span class="font-extrabold text-[12px] text-slate-950">VLM Assistant</span>
-        <span id="fabModelText" class="text-[9px] text-slate-900/80 font-mono font-semibold">minimax/minimax-m3</span>
+        <span id="fabModelText" class="text-[9px] text-slate-900/80 font-mono font-semibold">antigravity/gemini-3.6-flash-medium</span>
       </div>
       <span id="aiFabBadge" class="hidden px-1.5 py-0.5 bg-slate-950 text-emerald-400 text-[10px] font-mono rounded-full border border-emerald-500/30">0</span>
     </button>
@@ -1475,7 +1891,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="min-w-0">
           <div class="flex items-center gap-1.5">
             <h3 class="font-bold text-xs text-slate-200 truncate">VLM Video Assistant</h3>
-            <span id="drawerModelPill" class="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono">minimax/minimax-m3</span>
+            <span id="drawerModelPill" class="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono">antigravity/gemini-3.6-flash-medium</span>
           </div>
           <p id="aiChatActiveVideoLabel" class="text-[10px] text-slate-400 truncate font-mono">No video selected</p>
         </div>
@@ -1561,6 +1977,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="flex flex-col gap-1">
         <label class="text-[11px] text-slate-400 font-medium">Provider:</label>
         <select id="aiProviderSelect" onchange="onProviderChange()" class="bg-slate-950 text-slate-200 rounded px-2 py-1.5 border border-slate-700 focus:outline-none">
+          <option value="omniroute" selected>OmniRoute (Localhost 20128 - Gemini 3.6 Flash Medium)</option>
           <option value="openrouter">OpenRouter (DeepSeek, Claude, Llama...)</option>
           <option value="openai">OpenAI (GPT-4o, GPT-4o-mini)</option>
           <option value="custom">Custom OpenAI-compatible URL</option>
@@ -1569,18 +1986,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       <div id="aiCustomUrlGroup" class="flex flex-col gap-1 hidden">
         <label class="text-[11px] text-slate-400 font-medium">Custom API URL:</label>
-        <input id="aiCustomUrlInput" type="text" placeholder="http://localhost:11434/v1/chat/completions" class="bg-slate-950 text-slate-200 rounded px-2.5 py-1.5 border border-slate-700 focus:outline-none" />
+        <input id="aiCustomUrlInput" type="text" placeholder="http://localhost:20128/v1/chat/completions" class="bg-slate-950 text-slate-200 rounded px-2.5 py-1.5 border border-slate-700 focus:outline-none" />
       </div>
 
       <div class="flex flex-col gap-1">
         <label class="text-[11px] text-slate-400 font-medium">Model Identifier:</label>
-        <input id="aiModelInput" type="text" placeholder="minimax/minimax-m3" class="bg-slate-950 text-slate-200 rounded px-2.5 py-1.5 border border-slate-700 focus:outline-none" />
+        <input id="aiModelInput" type="text" value="antigravity/gemini-3.6-flash-medium" placeholder="antigravity/gemini-3.6-flash-medium" class="bg-slate-950 text-slate-200 rounded px-2.5 py-1.5 border border-slate-700 focus:outline-none" />
       </div>
 
       <div class="flex flex-col gap-1">
         <label class="text-[11px] text-slate-400 font-medium">API Key (Optional override):</label>
-        <input id="aiApiKeyInput" type="password" placeholder="sk-or-v1-... / sk-..." class="bg-slate-950 text-slate-200 rounded px-2.5 py-1.5 border border-slate-700 focus:outline-none" />
-        <span class="text-[10px] text-slate-500">Lưu trực tiếp trên trình duyệt. Để trống để sử dụng biến môi trường server.</span>
+        <input id="aiApiKeyInput" type="password" value="omniroute" placeholder="omniroute" class="bg-slate-950 text-slate-200 rounded px-2.5 py-1.5 border border-slate-700 focus:outline-none" />
+        <span class="text-[10px] text-slate-500">Mặc định: 'omniroute' (OmniRoute localhost proxy).</span>
       </div>
 
       <div class="flex items-center justify-between pt-1 border-t border-slate-800">
@@ -1666,10 +2083,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let videoChatHistories = {}; // video_id -> [ { role, content, time } ]
     let isChatSending = false;
     let aiSettings = {
-      provider: 'openrouter',
-      model: 'minimax/minimax-m3',
-      apiKey: '',
-      customUrl: '',
+      provider: 'omniroute',
+      model: 'antigravity/gemini-3.6-flash-medium',
+      apiKey: 'omniroute',
+      customUrl: 'http://localhost:20128/v1/chat/completions',
       autoOpen: false // Fix: Disabled auto popup
     };
 
@@ -2909,8 +3326,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function saveChatSettings() {
       aiSettings.provider = document.getElementById('aiProviderSelect').value;
-      aiSettings.model = document.getElementById('aiModelInput').value.trim() || (aiSettings.provider === 'openai' ? 'gpt-4o-mini' : 'minimax/minimax-m3');
-      aiSettings.apiKey = document.getElementById('aiApiKeyInput').value.trim();
+      const defaultModel = aiSettings.provider === 'openai' ? 'gpt-4o-mini' : (aiSettings.provider === 'openrouter' ? 'minimax/minimax-m3' : 'antigravity/gemini-3.6-flash-medium');
+      aiSettings.model = document.getElementById('aiModelInput').value.trim() || defaultModel;
+      aiSettings.apiKey = document.getElementById('aiApiKeyInput').value.trim() || (aiSettings.provider === 'omniroute' ? 'omniroute' : '');
       aiSettings.customUrl = document.getElementById('aiCustomUrlInput').value.trim();
       aiSettings.autoOpen = document.getElementById('aiAutoOpenCheckbox').checked;
 
@@ -2935,6 +3353,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const provider = document.getElementById('aiProviderSelect').value;
       const customGroup = document.getElementById('aiCustomUrlGroup');
       const modelInput = document.getElementById('aiModelInput');
+      const keyInput = document.getElementById('aiApiKeyInput');
       
       if (provider === 'custom') {
         customGroup.classList.remove('hidden');
@@ -2942,10 +3361,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         customGroup.classList.add('hidden');
       }
 
-      if (provider === 'openai' && !modelInput.value.includes('gpt')) {
-        modelInput.value = 'gpt-4o-mini';
-      } else if (provider === 'openrouter' && !modelInput.value.includes('minimax')) {
-        modelInput.value = 'minimax/minimax-m3';
+      if (provider === 'omniroute') {
+        if (!modelInput.value || modelInput.value.includes('minimax') || modelInput.value.includes('gpt')) {
+          modelInput.value = 'antigravity/gemini-3.6-flash-medium';
+        }
+        if (!keyInput.value) keyInput.value = 'omniroute';
+      } else if (provider === 'openai') {
+        if (!modelInput.value.includes('gpt')) modelInput.value = 'gpt-4o-mini';
+      } else if (provider === 'openrouter') {
+        if (!modelInput.value.includes('minimax')) modelInput.value = 'minimax/minimax-m3';
       }
     }
 
@@ -3715,6 +4139,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <span class="text-slate-400 font-mono">Frame ${item.frame_idx}</span>
               </div>
 
+              ${item.matched_scene ? `
+                <div class="mt-1.5 text-[10px] text-sky-300 font-medium bg-sky-950/50 px-2 py-1 rounded-md border border-sky-800/50 line-clamp-2 leading-tight flex items-start gap-1">
+                  <span class="text-sky-400 font-bold whitespace-nowrap">🎯 Matched:</span>
+                  <span class="italic truncate">${item.matched_scene}</span>
+                </div>
+              ` : ''}
+
               <!-- Task Mode Badges on Card -->
               ${currentTaskMode === 'qa' ? `
                 <div class="mt-2 text-[11px] ${qaAns ? 'bg-amber-950/40 border-amber-500/40 text-amber-200' : 'bg-slate-900 border-slate-800 text-slate-500 italic'} p-2 rounded-lg border leading-relaxed flex items-start gap-1">
@@ -4090,197 +4521,213 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 
 class RequestHandler(BaseHTTPRequestHandler):
+    def _send_json_error(self, status_code: int, error_message: str):
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps({"error": error_message}, ensure_ascii=False).encode("utf-8"))
+
     def do_HEAD(self):
         self.do_GET()
 
     def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-        query = urllib.parse.parse_qs(parsed.query)
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            query = urllib.parse.parse_qs(parsed.query)
 
-        if path == "/":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(HTML_PAGE.encode("utf-8"))
-
-        elif path == "/api/frame":
-            vid = query.get("video_id", [""])[0]
-            try:
-                fid = int(query.get("frame_idx", [0])[0])
-            except ValueError:
-                fid = 0
-
-            jpg_data = ENGINE.extract_thumbnail(vid, fid)
-            if jpg_data:
+            if path == "/":
                 self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Cache-Control", "public, max-age=86400")
+                self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
-                self.wfile.write(jpg_data)
+                self.wfile.write(HTML_PAGE.encode("utf-8"))
+
+            elif path == "/api/frame":
+                vid = sanitize_video_id(query.get("video_id", [""])[0])
+                try:
+                    fid = int(query.get("frame_idx", [0])[0])
+                except (ValueError, TypeError):
+                    fid = 0
+
+                jpg_data = ENGINE.extract_thumbnail(vid, fid)
+                if jpg_data:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Cache-Control", "public, max-age=86400")
+                    self.end_headers()
+                    self.wfile.write(jpg_data)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            elif path == "/api/video":
+                vid = sanitize_video_id(query.get("video_id", [""])[0])
+                vid_path = ENGINE.video_paths.get(vid)
+                if not vid_path or not os.path.exists(vid_path):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+
+                file_size = os.path.getsize(vid_path)
+                range_header = self.headers.get("Range")
+
+                if not range_header:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Content-Length", str(file_size))
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.end_headers()
+                    try:
+                        with open(vid_path, "rb") as f:
+                            while chunk := f.read(65536):
+                                self.wfile.write(chunk)
+                    except Exception:
+                        pass
+                    return
+
+                range_match = re.match(r"bytes=(\d+)-(\d*)", range_header)
+                if not range_match:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.end_headers()
+                    return
+
+                start = int(range_match.group(1))
+                end = int(range_match.group(2)) if range_match.group(2) else file_size - 1
+                end = min(end, file_size - 1)
+
+                if start < 0 or start >= file_size or start > end:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.end_headers()
+                    return
+
+                chunk_size = end - start + 1
+
+                self.send_response(206)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                self.send_header("Content-Length", str(chunk_size))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+
+                try:
+                    with open(vid_path, "rb") as f:
+                        f.seek(start)
+                        bytes_left = chunk_size
+                        while bytes_left > 0:
+                            read_len = min(bytes_left, 65536)
+                            data = f.read(read_len)
+                            if not data:
+                                break
+                            self.wfile.write(data)
+                            bytes_left -= len(data)
+                except Exception:
+                    pass
+
+            elif path == "/api/video_context":
+                vid = sanitize_video_id(query.get("video_id", [""])[0])
+                try:
+                    pts = float(query.get("pts_time", [0.0])[0])
+                    if not math.isfinite(pts):
+                        pts = 0.0
+                except (ValueError, TypeError):
+                    pts = 0.0
+                ctx = ENGINE.get_video_context(vid, pts)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps(ctx, ensure_ascii=False).encode("utf-8"))
+
             else:
                 self.send_response(404)
                 self.end_headers()
-
-        elif path == "/api/video":
-            vid = query.get("video_id", [""])[0]
-            vid_path = ENGINE.video_paths.get(vid)
-            if not vid_path or not os.path.exists(vid_path):
-                self.send_response(404)
-                self.end_headers()
-                return
-
-            file_size = os.path.getsize(vid_path)
-            range_header = self.headers.get("Range")
-
-            if not range_header:
-                self.send_response(200)
-                self.send_header("Content-Type", "video/mp4")
-                self.send_header("Content-Length", str(file_size))
-                self.send_header("Accept-Ranges", "bytes")
-                self.end_headers()
-                try:
-                    with open(vid_path, "rb") as f:
-                        while chunk := f.read(65536):
-                            self.wfile.write(chunk)
-                except Exception:
-                    pass
-                return
-
-            range_match = re.match(r"bytes=(\d+)-(\d*)", range_header)
-            if not range_match:
-                self.send_response(416)
-                self.end_headers()
-                return
-
-            start = int(range_match.group(1))
-            end = int(range_match.group(2)) if range_match.group(2) else file_size - 1
-            end = min(end, file_size - 1)
-            chunk_size = end - start + 1
-
-            self.send_response(206)
-            self.send_header("Content-Type", "video/mp4")
-            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
-            self.send_header("Content-Length", str(chunk_size))
-            self.send_header("Accept-Ranges", "bytes")
-            self.end_headers()
-
-            try:
-                with open(vid_path, "rb") as f:
-                    f.seek(start)
-                    bytes_left = chunk_size
-                    while bytes_left > 0:
-                        read_len = min(bytes_left, 65536)
-                        data = f.read(read_len)
-                        if not data:
-                            break
-                        self.wfile.write(data)
-                        bytes_left -= len(data)
-            except Exception:
-                pass
-
-        elif path == "/api/video_context":
-            vid = query.get("video_id", [""])[0]
-            try:
-                pts = float(query.get("pts_time", [0.0])[0])
-            except ValueError:
-                pts = 0.0
-            ctx = ENGINE.get_video_context(vid, pts)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(json.dumps(ctx, ensure_ascii=False).encode("utf-8"))
-
-        else:
-            self.send_response(404)
-            self.end_headers()
+        except Exception as exc:
+            self._send_json_error(500, f"Server Error: {str(exc)}")
 
     def do_POST(self):
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/api/search":
+        try:
+            parsed = urllib.parse.urlparse(self.path)
             content_len = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_len)
+            body = self.rfile.read(content_len) if content_len > 0 else b"{}"
             try:
-                payload = json.loads(body.decode("utf-8"))
+                payload = json.loads(body.decode("utf-8")) if body else {}
             except Exception:
-                payload = {}
+                self._send_json_error(400, "Invalid JSON payload format.")
+                return
 
-            q = payload.get("query", "")
-            keywords = payload.get("keywords", [])
-            w_dense = float(payload.get("w_dense", 0.50))
-            w_asr = float(payload.get("w_asr", 0.50))
-            top_k = int(payload.get("top_k", 100))
+            if parsed.path == "/api/search":
+                q = str(payload.get("query", ""))
+                keywords = payload.get("keywords") if isinstance(payload.get("keywords"), list) else []
+                w_dense = payload.get("w_dense", 0.50)
+                w_asr = payload.get("w_asr", 0.50)
+                top_k = payload.get("top_k", 100)
 
-            res = ENGINE.search(q, keywords=keywords, w_dense=w_dense, w_asr=w_asr, top_k=top_k)
+                res = ENGINE.search(q, keywords=keywords, w_dense=w_dense, w_asr=w_asr, top_k=top_k)
 
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(json.dumps(res, ensure_ascii=False).encode("utf-8"))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps(res, ensure_ascii=False).encode("utf-8"))
 
-        elif parsed.path == "/api/refine":
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_len)
-            try:
-                payload = json.loads(body.decode("utf-8"))
-            except Exception:
-                payload = {}
+            elif parsed.path == "/api/refine":
+                q = str(payload.get("query", ""))
+                marked_items = payload.get("marked_items") if isinstance(payload.get("marked_items"), list) else []
+                keywords = payload.get("keywords") if isinstance(payload.get("keywords"), list) else []
+                w_dense = payload.get("w_dense", 0.50)
+                w_asr = payload.get("w_asr", 0.50)
+                top_k = payload.get("top_k", 100)
 
-            q = payload.get("query", "")
-            marked_items = payload.get("marked_items", [])
-            keywords = payload.get("keywords", [])
-            w_dense = float(payload.get("w_dense", 0.50))
-            w_asr = float(payload.get("w_asr", 0.50))
-            top_k = int(payload.get("top_k", 100))
+                res = ENGINE.refine(q, marked_items=marked_items, keywords=keywords, w_dense=w_dense, w_asr=w_asr, top_k=top_k)
 
-            res = ENGINE.refine(q, marked_items=marked_items, keywords=keywords, w_dense=w_dense, w_asr=w_asr, top_k=top_k)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps(res, ensure_ascii=False).encode("utf-8"))
 
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(json.dumps(res, ensure_ascii=False).encode("utf-8"))
+            elif parsed.path == "/api/chat":
+                video_id = sanitize_video_id(payload.get("video_id", ""))
+                try:
+                    frame_idx = int(payload.get("frame_idx", 0))
+                except (ValueError, TypeError):
+                    frame_idx = 0
+                try:
+                    pts_time = float(payload.get("pts_time", 0.0))
+                except (ValueError, TypeError):
+                    pts_time = 0.0
 
-        elif parsed.path == "/api/chat":
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_len)
-            try:
-                payload = json.loads(body.decode("utf-8"))
-            except Exception:
-                payload = {}
+                start_sec = payload.get("start_sec")
+                end_sec = payload.get("end_sec")
+                user_query = str(payload.get("query", ""))
+                messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+                api_key = str(payload.get("api_key", ""))
+                provider = str(payload.get("provider", "omniroute"))
+                model = str(payload.get("model", ""))
+                custom_url = str(payload.get("custom_url", ""))
 
-            video_id = payload.get("video_id", "")
-            frame_idx = int(payload.get("frame_idx", 0))
-            pts_time = float(payload.get("pts_time", 0.0))
-            start_sec = payload.get("start_sec")
-            end_sec = payload.get("end_sec")
-            user_query = payload.get("query", "")
-            messages = payload.get("messages", [])
-            api_key = payload.get("api_key", "")
-            provider = payload.get("provider", "openrouter")
-            model = payload.get("model", "")
-            custom_url = payload.get("custom_url", "")
+                res = ENGINE.chat_completion(
+                    messages=messages,
+                    video_id=video_id,
+                    frame_idx=frame_idx,
+                    pts_time=pts_time,
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                    query=user_query,
+                    api_key=api_key,
+                    provider=provider,
+                    model=model,
+                    custom_url=custom_url
+                )
 
-            res = ENGINE.chat_completion(
-                messages=messages,
-                video_id=video_id,
-                frame_idx=frame_idx,
-                pts_time=pts_time,
-                start_sec=start_sec,
-                end_sec=end_sec,
-                query=user_query,
-                api_key=api_key,
-                provider=provider,
-                model=model,
-                custom_url=custom_url
-            )
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(json.dumps(res, ensure_ascii=False).encode("utf-8"))
-        else:
-            self.send_response(404)
-            self.end_headers()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps(res, ensure_ascii=False).encode("utf-8"))
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except Exception as exc:
+            self._send_json_error(500, f"Internal Server Error: {str(exc)}")
 
     def log_message(self, format, *args):
         pass

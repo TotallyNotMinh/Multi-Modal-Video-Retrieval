@@ -1,0 +1,63 @@
+# Action Plan — Retrieval Benchmark & Pipeline
+
+Status marked from what's already been shown working in this conversation vs. what's
+still open. Ordered so cheap/high-leverage items go first, expensive/uncertain items
+go last.
+
+## ✅ Already done (confirmed by results you've shared)
+1. Replaced online translation scraping with a local/deterministic MT fix ("translation fix") — confirmed via before/after ablation tables.
+2. Ran the fusion weight sweep including the ASR-heavy (0.30/0.70) point — confirmed winner on both entity_search and overall 627-query set.
+3. Ran the frame-derived visual pilot (n=25) and confirmed the transcript-generation bias hypothesis.
+4. Sub-stratified frame-derived queries into entity/text-grounded vs action/scene-grounded, and found the 0% vs 44% top-30 split.
+
+## 🔜 Do next, in order (if already done skip them)
+
+### 1. Statistical hygiene on what you already have
+- [x] Bootstrap/paired significance test on ASR-heavy vs Pure ASR (CONFIRMED: Overall R@1 28.87% vs 22.33%, p=0.0015 McNemar; MRR 0.3876 vs 0.2938, p<10^-4. On entity_search, gap is 12.0% vs 13.0%, p=1.0000 exact binomial noise). Report: eval/reports/01_statistical_hygiene_report.md
+- [x] Correct the "0.0% Top-30 Hit Rate" framing for Tier 3 (n=16) to include the upper-bound CI (Wilson 95% CI: [0.0%, 19.4%], Rule-of-Three: 18.8%, Clopper-Pearson: [0.0%, 20.6%]). Report: eval/reports/01_statistical_hygiene_report.md
+
+### 2. Calibration fix for unanswerable detection (proposed, not yet validated)
+- [x] Implement the sigmoid/absolute calibration (norm_bm25 soft-saturation, norm_e5 clip, BGE sigmoid, and CLIP confidence scaling).
+- [x] Fit the calibration constants and evaluate distributions across modalities (BM25, E5, BGE, CLIP).
+- [x] Re-run the τ-threshold sweep and false-positive rate on the frozen benchmark (CONFIRMED: Hard in-domain unanswerable queries share vocabulary with target videos, explaining high embedding scores; verified operating curves and recommended tau=0.55 rejection with VLM context verification). Report: eval/reports/02_unanswerable_calibration_report.md
+
+### 3. OCR into candidate generation (cheap — reuses existing keyframes)
+- [x] Run OCR (already 873 videos with 19,724 detections pre-extracted with EasyOCR and cached in cache/ocr_text).
+- [x] Feed OCR tokens into **initial candidate generation** (sparse/BM25 side: 18,451 merged OCR banner documents indexed into BM25Engine at startup).
+- [x] Re-run the entity_search ablation table with OCR included and compare against the current OCR-less numbers (CONFIRMED: Pure Speech/OCR R@1 increased from 22.3% -> 24.2%, VISUAL_HYBRID R@1 jumped from 21.4% -> 32.0%, LOW_OVERLAP jumped from 7.3% -> 10.1%, Pure Visual Dense remained at 0.0% R@1 on ENTITY_SEARCH confirming OCR necessity). Report: eval/reports/03_ocr_candidate_generation_report.md
+
+### 4. Cheap diagnostic before any re-encoding decision
+- [ ] For 5–8 of the Tier-3 (action/scene) misses, pull 3–5 frames spread across the segment (not just the currently-indexed one) and manually check whether any frame actually shows the action.
+  - If yes on most → the fix is denser frame sampling / multi-frame pooling per segment (cheap).
+  - If no on most → genuine static-frame ceiling, which justifies bigger investment later (see long-term section).
+- [ ] Separately, sanity-check the visual pipeline itself (frame sampling rate, embedding indexing, normalization) using existing SigLIP embeddings before assuming any capacity ceiling — rule out a pipeline bug first.
+
+### 5. Text-embedding upgrade (cheap — reuses existing refined transcripts)
+- [ ] Re-embed existing LLM-refined Vietnamese transcripts with BGE-M3 (no re-transcription needed).
+- [ ] Re-run the low_overlap ablation to see if the 7.3% R@1 ceiling moves — this was diagnosed as a representation-capacity issue, not a fusion-weighting issue.
+
+### 6. Fill out statistical power on thin categories
+- [ ] Expand entity_search and direct_info samples (currently thinner CIs) toward n≈100 if not already done.
+- [ ] Scale visual_entity_text_grounded and visual_action_scene_grounded pilots from n=9/n=16 up to ~40–50 each once the sampling diagnostic (#4) is resolved, so hit-rate numbers are trustworthy before reporting.
+
+### 7. Re-run global fusion sweep on the corrected benchmark
+- [ ] Once translation, calibration, OCR, and BGE-M3 changes have landed, re-run the full fusion weight sweep (finer granularity, e.g. 0.05 increments in the 0.05–0.30 dense range) on the whole corrected/stratified benchmark.
+- [ ] Decompose the ASR channel into BM25-only vs E5-only to see which is actually driving the gains, given the earlier BM25-over-amplification bug.
+- [ ] Run this separately per tier (visual_speech_correlated / visual_entity_text_grounded / visual_action_scene_grounded / other query types) rather than one blended number — you now know blending hides real differences.
+
+### 8. Domain transfer check (news/TV corpus)
+- [ ] Pull a small stratified pilot (~50–100 segments) from the new news/TV footage.
+- [ ] Run it through the same Gemini query-generation pipeline and manually check the category mix reflects real search behavior for that domain.
+- [ ] Specifically test entity_search/numeric_temporal with vs. without OCR candidates (news chyrons/lower-thirds are OCR-friendly and may carry unique info not in speech).
+- [ ] Re-run the fusion sweep on this pilot rather than assuming the 0.30/0.70 weight transfers.
+
+### 9. Freeze and document
+- [ ] Formalize the three-tier stratification (visual_speech_correlated / visual_entity_text_grounded / visual_action_scene_grounded) in the benchmark methodology doc.
+- [ ] Explicitly label Tier 3 as "identified gap, no implemented solution yet" rather than an equally-shippable tier.
+- [ ] Document the transcript-generation-bias limitation for the original (non-frame-derived) query set, so future readers know the scope of what "ASR-heavy wins" actually means.
+- [ ] Version-tag this as benchmark v2 / eval-run v2 with full query counts and CIs included, so future re-runs after further model changes are comparable.
+
+## 🕒 Longer-term / only after the above (higher cost, less certain payoff)
+- [ ] If the sampling diagnostic (#4) confirms a genuine static-frame ceiling (not just sparse sampling): investigate object-level bounding-box indexing and/or multi-frame temporal CLIP for Tier 3 — this is a real infra project, not a quick fix, so scope it separately with its own cost/benefit case.
+- [ ] If a stronger visual encoder is still worth testing after the diagnostic, test it on a small stratified subset (5–10 hrs of video) before committing to any full 120+ hour re-encode.
+- [ ] Revisit whether e5-mistral-7b (only testable on Kaggle, not locally) is worth it over BGE-M3 for the corpus-side embeddings, now that VRAM isn't the constraint for offline processing — but remember your local 6GB query-time serving box still needs a model that fits, so this only matters if you're open to a heavier offline/online model mismatch strategy (e.g. asymmetric encoders) or accept BGE-M3 for both.
