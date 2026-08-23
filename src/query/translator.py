@@ -25,10 +25,12 @@ class QueryTranslator:
     ):
         self.use_online = use_online
         self.omniroute_url = omniroute_url
-        self.model_name = "antigravity/gemini-3.6-flash-low"
+        self.model_name = "antigravity/gemini-3.6-flash-medium"
         self.cache_file = cache_file
         self.google_translator = GoogleTranslator(source='vi', target='en') if (_HAS_TRANSLATOR and use_online) else None
         self.cache = {}
+        self._fail_count = 0
+        self._omniroute_available = True
         
         # Load persistent disk cache
         self._load_disk_cache()
@@ -105,14 +107,32 @@ class QueryTranslator:
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(self.omniroute_url, data=data, headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=0.5) as resp:
-                res = json.loads(resp.read().decode("utf-8"))
-                translated = res["choices"][0]["message"]["content"].strip()
+            with urllib.request.urlopen(req, timeout=10.0) as resp:
+                raw_bytes = resp.read()
+                raw_str = raw_bytes.decode("utf-8").strip()
+                translated = ""
+                if raw_str.startswith("data:"):
+                    for line in raw_str.splitlines():
+                        line = line.strip()
+                        if line.startswith("data:") and line != "data: [DONE]":
+                            try:
+                                chunk = json.loads(line[5:].strip())
+                                delta = chunk["choices"][0].get("delta", {})
+                                translated += delta.get("content", "")
+                            except Exception:
+                                pass
+                else:
+                    res = json.loads(raw_str)
+                    translated = res["choices"][0]["message"]["content"].strip()
+
                 translated = re.sub(r"^[\"']|[\"']$", "", translated).strip()
                 if translated:
+                    self._fail_count = 0
                     return translated
         except Exception:
-            self._omniroute_available = False
+            self._fail_count = getattr(self, "_fail_count", 0) + 1
+            if self._fail_count >= 5:
+                self._omniroute_available = False
             return None
         return None
 
@@ -138,6 +158,7 @@ class QueryTranslator:
             except Exception:
                 pass
 
+        is_authoritative = bool(res)
         # 3. Fallback keyword replacement dictionary
         if not res:
             en_words = []
@@ -151,8 +172,9 @@ class QueryTranslator:
         if not res:
             res = cleaned
 
-        self.cache[cleaned] = res
-        self._save_disk_cache()
+        if is_authoritative:
+            self.cache[cleaned] = res
+            self._save_disk_cache()
         return res
 
     def generate_prompts(self, query_en: str) -> List[str]:

@@ -842,10 +842,10 @@ class SearchEngine:
         top_indices: np.ndarray,
         top_k: int,
         initial_candidates: Optional[List[int]] = None,
-        window_sec: float = 2.0
+        window_sec: float = 1.5
     ) -> List[int]:
         """
-        Deduplicates keyframe candidates belonging to the same video within +/- window_sec.
+        Deduplicates keyframe candidates belonging to the same video within +/- window_sec (default 1.5s aligned with GT tolerance).
         """
         seen_timestamps = defaultdict(list)
         final_candidates: List[int] = []
@@ -876,6 +876,61 @@ class SearchEngine:
                 break
 
         return final_candidates
+
+    def classify_query_intent(self, query: str) -> Dict[str, Any]:
+        """
+        Classifies query intent to dynamically determine optimal fusion routing:
+        - OCR / Text Grounded (Item #2): Boosts OCR BM25 signal (w_dense=0.25, w_asr=0.15, w_ocr=0.60)
+        - Speech / Dialogue Grounded (Item #3): Direct speech signals (w_dense=0.20, w_asr=0.80, w_ocr=0.0)
+        - Visual Objects / Scene: Visual grounding (w_dense=0.80, w_asr=0.20, w_ocr=0.0)
+        - Balanced Multi-modal: Fallback (w_dense=0.50, w_asr=0.50, w_ocr=0.0)
+        """
+        q_lower = query.lower()
+
+        # 1. Check OCR / On-screen text cues
+        has_quotes = bool(re.search(r'["\'«“"][^"\'»“”]+["\'»“”]', query))
+        ocr_keywords = r"\b(chữ|biển hiệu|bảng hiệu|bảng tên|banner|tiêu đề|logo|khẩu hiệu|băng rôn|dòng chữ|tấm biển|tấm bảng|in chữ|viết chữ|ghi chữ|biển báo|số áo|áo in số)\b"
+        has_ocr_kw = bool(re.search(ocr_keywords, q_lower))
+        if has_quotes or has_ocr_kw:
+            return {
+                "category": "visual_entity_text_grounded",
+                "w_dense": 0.25,
+                "w_asr": 0.15,
+                "w_ocr": 0.60,
+                "confidence": 0.90 if has_quotes else 0.80
+            }
+
+        # 2. Check Speech / Spoken dialogue cues
+        speech_keywords = r"\b(nói|phát biểu|giọng|chia sẻ|kể về|lời thoại|bàn về|nhắc đến|hỏi|trả lời|phỏng vấn|giảng bài|tư vấn|bình luận|hát|lời bài hát|thuyết minh|tại sao|như thế nào|bao nhiêu)\b"
+        has_speech_kw = bool(re.search(speech_keywords, q_lower))
+        if has_speech_kw:
+            return {
+                "category": "speech_dialogue_grounded",
+                "w_dense": 0.20,
+                "w_asr": 0.80,
+                "w_ocr": 0.0,
+                "confidence": 0.85
+            }
+
+        # 3. Check Visual scene / object appearance cues
+        visual_keywords = r"\b(mặc áo|màu|đang lái|đang chạy|nhảy|bơi|cười|ngủ|cảnh quay|khung cảnh|bầu trời|biển|núi|nhà|xe|đường phố|căn phòng|bếp|cây|hoa|con mèo|con chó)\b"
+        has_visual_kw = bool(re.search(visual_keywords, q_lower))
+        if has_visual_kw:
+            return {
+                "category": "visual_scene_object",
+                "w_dense": 0.80,
+                "w_asr": 0.20,
+                "w_ocr": 0.0,
+                "confidence": 0.80
+            }
+
+        return {
+            "category": "balanced_multimodal",
+            "w_dense": 0.50,
+            "w_asr": 0.50,
+            "w_ocr": 0.0,
+            "confidence": 0.50
+        }
 
     def _decompose_query_subscenes(self, query: str) -> List[str]:
         """
@@ -929,6 +984,21 @@ class SearchEngine:
             asr_window_sec = max(0.5, min(30.0, float(asr_window_sec)))
         except (ValueError, TypeError):
             asr_window_sec = 5.0
+
+        # Classify query intent and determine adaptive routing weights (Items #2 & #3)
+        intent_info = self.classify_query_intent(query)
+        detected_category = intent_info["category"]
+
+        # If caller used default weights (0.50/0.50), apply category-adaptive weights
+        is_default_weights = (abs(w_dense - 0.50) < 1e-4 and abs(w_asr - 0.50) < 1e-4)
+        if is_default_weights:
+            eff_w_dense = intent_info["w_dense"]
+            eff_w_asr = intent_info["w_asr"]
+            eff_w_ocr = intent_info["w_ocr"]
+        else:
+            eff_w_dense = w_dense
+            eff_w_asr = w_asr
+            eff_w_ocr = 0.0
 
         # --- A. Dense Visual Search (CLIP Multi-Scene + Holistic) ---
         en_query = self.translator.translate(query)
@@ -984,7 +1054,7 @@ class SearchEngine:
             norm_dense_scores = col_norm * d_conf
             dense_scores = dense_scores_whole
 
-        # --- B. Speech Transcript Search (BM25 Lexical + E5 Semantic) ---
+        # --- B. Speech Transcript & OCR Search (BM25 Lexical + E5 Semantic) ---
         bm25_hits = self.bm25.search(query, top_k=300)
         sem_hits = []
         if self.semantic_index is not None:
@@ -1004,8 +1074,14 @@ class SearchEngine:
                 st = doc["start_sec"]
                 et = doc["end_sec"]
                 txt = doc["text"]
-                # Sigmoidal absolute BM25 calibration: BM25 / (25.0 + BM25)
-                norm_b = float(b_score) / (25.0 + float(b_score))
+                is_ocr_doc = (doc.get("source") == "ocr")
+
+                # Sigmoidal absolute BM25 calibration with OCR boosting for text-grounded queries
+                if is_ocr_doc:
+                    ocr_mult = (1.5 + 2.0 * eff_w_ocr) if eff_w_ocr > 0 else 1.2
+                    norm_b = min(1.0, float(b_score) / (15.0 + float(b_score)) * ocr_mult)
+                else:
+                    norm_b = float(b_score) / (25.0 + float(b_score))
 
                 # Assign boost to all keyframes belonging to this video within [st - asr_window_sec, et + asr_window_sec]
                 kf_indices = self.video_to_records.get(vid, [])
@@ -1074,17 +1150,17 @@ class SearchEngine:
                                     keyframe_asr_texts[k_idx] = txt
 
         # --- C. Multi-Modal Fusion ---
-        fused_scores = (w_dense * norm_dense_scores) + (w_asr * keyframe_asr_scores)
+        fused_scores = (eff_w_dense * norm_dense_scores) + (eff_w_asr * keyframe_asr_scores)
         if keywords:
-            fused_scores += self._compute_keyword_scores(keywords, w_dense, w_asr, keyframe_asr_texts)
+            fused_scores += self._compute_keyword_scores(keywords, eff_w_dense, eff_w_asr, keyframe_asr_texts)
 
         # Get top-K candidate indices with safe bounds
         k_pool = min(max(top_k * 4, 1), len(self.records))
         top_indices = np.argpartition(fused_scores, -k_pool)[-k_pool:]
         top_indices = top_indices[np.argsort(fused_scores[top_indices])[::-1]]
 
-        # Diversity / Non-Maximum Suppression (deduplicate within ±2 seconds in same video)
-        final_candidates = self._apply_temporal_nms(top_indices, top_k=top_k, window_sec=2.0)
+        # Diversity / Non-Maximum Suppression (deduplicate within ±1.5 seconds aligned with GT tolerance)
+        final_candidates = self._apply_temporal_nms(top_indices, top_k=top_k, window_sec=1.5)
 
         # Build output response list
         results = []
@@ -1124,6 +1200,12 @@ class SearchEngine:
         return {
             "query_vi": query,
             "translated_query": en_query,
+            "detected_category": detected_category,
+            "effective_weights": {
+                "w_dense": eff_w_dense,
+                "w_asr": eff_w_asr,
+                "w_ocr": eff_w_ocr
+            },
             "sub_scenes": sub_clauses if len(sub_clauses) > 1 else [],
             "asr_window_sec": asr_window_sec,
             "search_time_ms": search_time_ms,

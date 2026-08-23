@@ -4,9 +4,15 @@ os.environ["HF_HUB_DISABLE_FILE_LOCKING"] = "1"
 import torch
 import numpy as np
 import gc
+
+if not hasattr(np, "long"):
+    np.long = int
+if not hasattr(np, "ulong"):
+    np.ulong = int
+
 from PIL import Image
 from typing import List, Union, Optional
-from transformers import AutoProcessor, AutoModel
+from transformers import AutoImageProcessor, AutoModel
 
 
 class SigLIPEncoder:
@@ -36,10 +42,10 @@ class SigLIPEncoder:
 
         print(f"[SigLIPEncoder] Loading {model_name} on {self.device} (FP16={self.use_fp16})...")
         try:
-            self.processor = AutoProcessor.from_pretrained(model_name, local_files_only=True)
+            self.processor = AutoImageProcessor.from_pretrained(model_name, local_files_only=True)
             self.model = AutoModel.from_pretrained(model_name, local_files_only=True)
         except Exception:
-            self.processor = AutoProcessor.from_pretrained(model_name)
+            self.processor = AutoImageProcessor.from_pretrained(model_name)
             self.model = AutoModel.from_pretrained(model_name)
 
         if self.use_fp16:

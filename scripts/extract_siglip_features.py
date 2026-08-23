@@ -1,3 +1,12 @@
+#!/usr/bin/env python3
+"""
+Production SigLIP-SO400M Feature Extraction Pipeline:
+- Adaptive Hybrid Decoding: Fast PyAV I-frame extraction + grab-stride gap filling (<= 2.5s) + talking-head pruning.
+- Bicubic Aspect-Preserving Preprocessing: Avoids 16:9 -> 1:1 squishing artifacts; matches SigLIP training recipe.
+- Multi-Process CPU Prefetching: 3-4 parallel CPU worker processes saturate GPU Tensor Cores.
+- Full Metadata Auditing: Logs sampling route ('pyav_hybrid_adaptive' vs 'opencv_uniform_fallback'), resolutions, and timestamps.
+"""
+
 import os
 import sys
 import gc
@@ -5,111 +14,217 @@ import glob
 import json
 import time
 import argparse
+import multiprocessing as mp
 import cv2
 import torch
 import numpy as np
+from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
 
-# Ensure repo root is always in sys.path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# SciPy / NumPy compatibility patch
+if not hasattr(np, "long"):
+    np.long = int
+if not hasattr(np, "ulong"):
+    np.ulong = int
+
+# Ensure repo root is in sys.path
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from src.encoding.siglip_encoder import SigLIPEncoder
-from src.encoding.scene_detector import SceneDetector
 
 
-
-def extract_keyframes_from_video(vid_path: str, target_size=(384, 384), sample_interval_sec: float = 1.5):
+def preprocess_siglip_frame(
+    img: np.ndarray,
+    target_size: Tuple[int, int] = (384, 384),
+    preserve_aspect: bool = True
+) -> np.ndarray:
     """
-    Ultra-fast C-level keyframe decoder using PyAV with skip_frame='NONKEY'.
-    Decodes true I-frames in ~0.5-0.8 seconds per video without decoding intermediate B/P frames.
-    Falls back gracefully to OpenCV if needed.
+    Preprocesses raw RGB frame for Google SigLIP (SO400M):
+    - Bicubic antialiasing interpolation (matching SigLIP training recipe).
+    - Preserves aspect ratio with neutral 128 (0.0 normalized) padding to prevent horizontal compression.
     """
-    frames_rgb = []
-    meta_list = []
+    if not preserve_aspect:
+        return cv2.resize(img, target_size, interpolation=cv2.INTER_CUBIC)
+
+    h, w = img.shape[:2]
+    tw, th = target_size
+    scale = min(tw / w, th / h)
+    nw = max(1, int(round(w * scale)))
+    nh = max(1, int(round(h * scale)))
+
+    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_CUBIC)
+    canvas = np.full((th, tw, 3), 128, dtype=np.uint8)
+
+    top = (th - nh) // 2
+    left = (tw - nw) // 2
+    canvas[top:top + nh, left:left + nw] = resized
+    return canvas
+
+
+def extract_hybrid_keyframes_from_video(
+    vid_path: str,
+    target_size: Tuple[int, int] = (384, 384),
+    max_gap_sec: float = 2.5,
+    min_gap_sec: float = 0.5,
+    hsv_sim_thresh: float = 0.96,
+    preserve_aspect: bool = True
+) -> Tuple[List[np.ndarray], List[Dict]]:
+    """
+    Adaptive Hybrid Keyframe Extractor:
+    1. Fast PyAV demux to extract true I-frames without decoding intermediate P/B frames.
+    2. Identifies temporal gaps > max_gap_sec and fills them using fast grab-stride reading.
+    3. Prunes redundant consecutive keyframes (< min_gap_sec with near-identical HSV histograms).
+    4. Applies bicubic aspect-preserving padding.
+    5. Falls back to uniform OpenCV sampling on corrupted streams.
+    """
     vid_name = os.path.splitext(os.path.basename(vid_path))[0]
+    raw_iframes = []
+    sampling_method = "pyav_hybrid_adaptive"
 
     try:
         import av
         container = av.open(vid_path)
         stream = container.streams.video[0]
         stream.codec_context.skip_frame = "NONKEY"
-        
+
         fps = float(stream.average_rate) if stream.average_rate else 30.0
         time_base = float(stream.time_base) if stream.time_base else (1.0 / fps)
-        shot_id = 0
+        orig_w = stream.width or 1024
+        orig_h = stream.height or 576
 
         for packet in container.demux(stream):
             for frame in packet.decode():
+                pts_sec = float(frame.pts * time_base) if frame.pts is not None else 0.0
                 arr = frame.to_ndarray(format="rgb24")
-                if arr.shape[0] != target_size[1] or arr.shape[1] != target_size[0]:
-                    arr = cv2.resize(arr, target_size, interpolation=cv2.INTER_AREA)
-                
-                pts_sec = float(frame.pts * time_base) if frame.pts is not None else (shot_id * 1.5)
-                frame_idx = int(round(pts_sec * fps))
-
-                frames_rgb.append(arr)
-                meta_list.append({
-                    "video_id": vid_name,
-                    "frame_idx": frame_idx,
-                    "pts_time": pts_sec,
-                    "fps": fps,
-                    "shot_id": shot_id,
-                    "shot_start_frame": max(0, frame_idx - int(fps)),
-                    "shot_end_frame": frame_idx + int(fps),
-                })
-                shot_id += 1
+                raw_iframes.append((pts_sec, arr, True))
         container.close()
-        if frames_rgb:
-            return frames_rgb, meta_list
-    except Exception:
-        pass
 
-    # OpenCV fallback
-    cap = cv2.VideoCapture(vid_path)
-    if not cap.isOpened():
-        return [], []
-    try:
+        raw_iframes.sort(key=lambda x: x[0])
+
+        # Gap filling for intervals > max_gap_sec
+        gap_frames = []
+        if len(raw_iframes) > 1:
+            needed_gap_pts = []
+            for i in range(len(raw_iframes) - 1):
+                t_start = raw_iframes[i][0]
+                t_end = raw_iframes[i + 1][0]
+                if (t_end - t_start) > max_gap_sec:
+                    cur_t = t_start + 1.5
+                    while cur_t < (t_end - 0.5):
+                        needed_gap_pts.append(cur_t)
+                        cur_t += 1.5
+
+            if needed_gap_pts:
+                cap = cv2.VideoCapture(vid_path)
+                for g_pts in needed_gap_pts:
+                    cap.set(cv2.CAP_PROP_POS_MSEC, g_pts * 1000.0)
+                    ret, f_arr = cap.read()
+                    if ret:
+                        rgb = cv2.cvtColor(f_arr, cv2.COLOR_BGR2RGB)
+                        gap_frames.append((g_pts, rgb, False))
+                cap.release()
+
+        all_candidates = sorted(raw_iframes + gap_frames, key=lambda x: x[0])
+
+    except Exception:
+        # Fallback to robust OpenCV grab-stride sampling
+        sampling_method = "opencv_uniform_fallback"
+        all_candidates = []
+        cap = cv2.VideoCapture(vid_path)
+        if not cap.isOpened():
+            return [], []
+
         raw_fps = cap.get(cv2.CAP_PROP_FPS)
         fps = float(raw_fps) if (raw_fps and not np.isnan(raw_fps) and raw_fps > 0) else 30.0
-        stride = max(1, int(round(fps * sample_interval_sec)))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total_frames <= 0:
-            total_frames = int(fps * 1800)
-        
-        shot_id = 0
-        for f_idx in range(0, total_frames, stride):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb_resized = cv2.resize(rgb, target_size, interpolation=cv2.INTER_AREA)
-            frames_rgb.append(rgb_resized)
-            meta_list.append({
-                "video_id": vid_name,
-                "frame_idx": f_idx,
-                "pts_time": f_idx / fps,
-                "fps": fps,
-                "shot_id": shot_id,
-                "shot_start_frame": max(0, f_idx - stride // 2),
-                "shot_end_frame": f_idx + stride // 2,
-            })
-            shot_id += 1
-    finally:
+        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1024)
+        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 576)
+        stride = max(1, int(round(fps * 1.5)))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or (fps * 1800))
+
+        f_idx = 0
+        while f_idx < total_frames:
+            if f_idx % stride == 0:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                all_candidates.append((f_idx / fps, rgb, False))
+            else:
+                if not cap.grab():
+                    break
+            f_idx += 1
         cap.release()
+
+    if not all_candidates:
+        return [], []
+
+    # Filter near-duplicate static frames & format output
+    frames_rgb = []
+    meta_list = []
+    prev_pts = -1.0
+    prev_hsv = None
+    shot_id = 0
+
+    for pts_sec, arr, is_iframe in all_candidates:
+        # Pruning check for rapid identical frames (< min_gap_sec)
+        if prev_pts >= 0 and (pts_sec - prev_pts) < min_gap_sec:
+            hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+            hist = cv2.normalize(cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256]), None).flatten()
+            if prev_hsv is not None and cv2.compareHist(prev_hsv, hist, cv2.HISTCMP_CORREL) > hsv_sim_thresh:
+                continue
+
+        processed_frame = preprocess_siglip_frame(arr, target_size=target_size, preserve_aspect=preserve_aspect)
+        frame_idx = int(round(pts_sec * fps))
+
+        frames_rgb.append(processed_frame)
+        meta_list.append({
+            "video_id": vid_name,
+            "frame_idx": frame_idx,
+            "pts_time": round(pts_sec, 3),
+            "fps": round(fps, 2),
+            "shot_id": shot_id,
+            "is_iframe": is_iframe,
+            "sampling_method": sampling_method,
+            "orig_resolution": [orig_w, orig_h],
+            "target_resolution": list(target_size),
+            "model_name": "google/siglip-so400m-patch14-384",
+            "embedding_dim": 1152,
+        })
+
+        shot_id += 1
+        prev_pts = pts_sec
+        hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+        prev_hsv = cv2.normalize(cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256]), None).flatten()
 
     return frames_rgb, meta_list
 
 
-import threading
-import queue
-
-def _prefetch_worker(vid_paths, out_queue, target_size, sample_interval_sec):
-    """CPU-side prefetch thread: decodes next video while GPU is busy encoding current one."""
-    for vid_path in vid_paths:
-        frames_rgb, meta_list = extract_keyframes_from_video(vid_path, target_size, sample_interval_sec)
-        out_queue.put((vid_path, frames_rgb, meta_list))
-    out_queue.put(None)  # sentinel
+def _mp_worker(
+    in_queue: mp.Queue,
+    out_queue: mp.Queue,
+    target_size: Tuple[int, int],
+    max_gap_sec: float,
+    min_gap_sec: float,
+    preserve_aspect: bool
+):
+    """Background worker process: decodes video frames in parallel across CPU cores."""
+    while True:
+        vid_path = in_queue.get()
+        if vid_path is None:
+            break
+        try:
+            frames, meta = extract_hybrid_keyframes_from_video(
+                vid_path=vid_path,
+                target_size=target_size,
+                max_gap_sec=max_gap_sec,
+                min_gap_sec=min_gap_sec,
+                preserve_aspect=preserve_aspect
+            )
+            out_queue.put((vid_path, frames, meta))
+        except Exception:
+            out_queue.put((vid_path, [], []))
 
 
 def extract_all_siglip_features(
@@ -117,14 +232,20 @@ def extract_all_siglip_features(
     output_dir: str = "cache/siglip_features",
     meta_dir: str = "cache/siglip_meta",
     device: str = "cuda:0",
-    batch_size: int = 256,
-    sample_interval_sec: float = 1.5,
+    batch_size: int = 32,
+    num_workers: int = 4,
+    max_gap_sec: float = 2.5,
+    min_gap_sec: float = 0.5,
+    preserve_aspect: bool = True,
     num_shards: int = 1,
     shard_id: int = 0,
+    specific_video_path: Optional[str] = None,
 ):
     """
-    Extracts SigLIP-SO400M embeddings using ultra-fast PyAV keyframe decoding (~0.8s per video).
-    Supports multi-GPU sharding. CPU decode overlaps GPU encode via background prefetch thread.
+    Main extraction orchestrator:
+    - Multi-process CPU pool handles decoding, gap-filling, and bicubic padding.
+    - Main process executes batch FP16 GPU inference on SigLIP-SO400M.
+    - Saves L2-normalized 1152-dim numpy arrays atomically.
     """
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(meta_dir, exist_ok=True)
@@ -132,105 +253,115 @@ def extract_all_siglip_features(
     if "cuda" in device and not torch.cuda.is_available():
         device = "cpu"
 
+    print(f"[*] Initializing SigLIP-SO400M Encoder on {device} (FP16)...")
     encoder = SigLIPEncoder(device=device, use_fp16=True)
 
-    video_files = sorted(glob.glob(os.path.join(videos_root, "Videos_L*", "video", "*.mp4")))
+    if specific_video_path:
+        video_files = [os.path.abspath(specific_video_path)]
+    else:
+        video_files = sorted(glob.glob(os.path.join(videos_root, "Videos_L*", "video", "*.mp4")))
     total_all = len(video_files)
     if num_shards > 1:
         video_files = [f for idx, f in enumerate(video_files) if idx % num_shards == shard_id]
 
-    # Filter out already-done videos
-    pending = [f for f in video_files
-               if not (os.path.exists(os.path.join(output_dir, f"{os.path.splitext(os.path.basename(f))[0]}.npy"))
-                       and os.path.exists(os.path.join(meta_dir, f"{os.path.splitext(os.path.basename(f))[0]}.json")))]
+    pending = [
+        f for f in video_files
+        if not (os.path.exists(os.path.join(output_dir, f"{os.path.splitext(os.path.basename(f))[0]}.npy"))
+                and os.path.exists(os.path.join(meta_dir, f"{os.path.splitext(os.path.basename(f))[0]}.json")))
+    ]
 
-    print(f"[SigLIP Extraction] Found {len(video_files)}/{total_all} video files (Shard {shard_id}/{num_shards}) on {device}.")
-    print(f"[SigLIP Extraction] {len(video_files) - len(pending)} already cached. Processing {len(pending)} remaining.")
+    print(f"[*] Found {len(video_files)}/{total_all} videos (Shard {shard_id}/{num_shards}).")
+    print(f"[*] {len(video_files) - len(pending)} already cached. Processing {len(pending)} pending videos with {num_workers} CPU workers.")
 
     if not pending:
-        print("[SigLIP Extraction] All videos already extracted.")
+        print("[✓] All videos already extracted.")
         return
+
+    # Setup multi-process decoding pipeline
+    in_queue = mp.Queue(maxsize=len(pending) + num_workers)
+    out_queue = mp.Queue(maxsize=num_workers * 2)
+
+    for p in pending:
+        in_queue.put(p)
+    for _ in range(num_workers):
+        in_queue.put(None)
+
+    workers = []
+    for _ in range(num_workers):
+        w = mp.Process(
+            target=_mp_worker,
+            args=(in_queue, out_queue, (384, 384), max_gap_sec, min_gap_sec, preserve_aspect),
+            daemon=True
+        )
+        w.start()
+        workers.append(w)
 
     total_frames_extracted = 0
     t0 = time.time()
 
-    # Start prefetch thread with queue depth 2 (decode N+1 while GPU encodes N)
-    prefetch_queue = queue.Queue(maxsize=2)
-    prefetch_thread = threading.Thread(
-        target=_prefetch_worker,
-        args=(pending, prefetch_queue, (384, 384), sample_interval_sec),
-        daemon=True
-    )
-    prefetch_thread.start()
-
-    with tqdm(total=len(pending), desc=f"Extracting SigLIP Shard {shard_id}") as pbar:
-        while True:
-            item = prefetch_queue.get()
-            if item is None:
-                break
-
-            vid_path, frames_rgb, meta_list = item
+    with tqdm(total=len(pending), desc=f"Extracting SigLIP (Shard {shard_id}/{num_shards})") as pbar:
+        for _ in range(len(pending)):
+            vid_path, frames_rgb, meta_list = out_queue.get()
             vid_name = os.path.splitext(os.path.basename(vid_path))[0]
             out_npy = os.path.join(output_dir, f"{vid_name}.npy")
             out_meta = os.path.join(meta_dir, f"{vid_name}.json")
 
-            if not frames_rgb:
-                pbar.update(1)
-                continue
+            if frames_rgb:
+                embeddings = encoder.encode_images(frames_rgb, batch_size=batch_size)
+                tmp_npy = f"{out_npy}.tmp.{os.getpid()}.npy"
+                tmp_meta = f"{out_meta}.tmp.{os.getpid()}.json"
+                np.save(tmp_npy, embeddings)
+                with open(tmp_meta, "w", encoding="utf-8") as f:
+                    json.dump(meta_list, f)
+                os.replace(tmp_npy, out_npy)
+                os.replace(tmp_meta, out_meta)
+                total_frames_extracted += len(meta_list)
 
-            embeddings = encoder.encode_images(frames_rgb, batch_size=batch_size)
-
-            tmp_npy = f"{out_npy}.tmp.{os.getpid()}.npy"
-            tmp_meta = f"{out_meta}.tmp.{os.getpid()}.json"
-            np.save(tmp_npy, embeddings)
-            with open(tmp_meta, "w", encoding="utf-8") as f:
-                json.dump(meta_list, f)
-            os.replace(tmp_npy, out_npy)
-            os.replace(tmp_meta, out_meta)
-
-            total_frames_extracted += len(meta_list)
             pbar.update(1)
 
-    prefetch_thread.join()
+    for w in workers:
+        w.join(timeout=2.0)
+
     elapsed = time.time() - t0
-    print(f"\n[SigLIP Extraction] Finished! Extracted {total_frames_extracted} frames "
-          f"in {elapsed / 60:.2f} minutes ({len(pending) / elapsed:.1f} videos/sec).")
+    print(f"\n[✓] SigLIP Extraction complete! Processed {len(pending)} videos ({total_frames_extracted} frames) "
+          f"in {elapsed / 60:.2f} mins ({len(pending) / max(0.1, elapsed):.2f} vids/sec).")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Extract SigLIP-SO400M embeddings from videos.")
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--interval", "--sample-interval-sec", type=float, default=1.5,
-                        help="Sampling interval in seconds between keyframes.")
-    parser.add_argument("--scene-threshold", type=float, default=0.35, help="Legacy alias.")
-    parser.add_argument("--num-shards", type=int, default=1, help="Total number of GPU shards.")
-    parser.add_argument("--shard-id", type=int, default=0, help="Current shard ID (0-indexed).")
-    parser.add_argument("--video-sample", type=str, default=None,
-                        help="If set, run on a single video file for debugging.")
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-workers", type=int, default=4, help="Number of parallel CPU decoding workers.")
+    parser.add_argument("--max-gap-sec", type=float, default=2.5, help="Maximum allowed gap between keyframes.")
+    parser.add_argument("--min-gap-sec", type=float, default=0.5, help="Minimum distance for near-duplicate pruning.")
+    parser.add_argument("--no-aspect", action="store_true", help="Disable aspect ratio padding (squish to square).")
+    parser.add_argument("--num-shards", type=int, default=1, help="Total GPU shards.")
+    parser.add_argument("--shard-id", type=int, default=0, help="Shard index (0-indexed).")
+    parser.add_argument("--video-sample", type=str, default=None, help="Extract a single test video.")
     args = parser.parse_args()
 
     if args.video_sample:
-        # Single-video debug mode
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmpdir:
-            vid_dir = os.path.dirname(args.video_sample)
-            # Create a synthetic videos_root structure
-            extract_all_siglip_features(
-                videos_root=os.path.join(os.path.dirname(vid_dir), ".."),
-                output_dir="cache/siglip_features",
-                meta_dir="cache/siglip_meta",
-                device=args.device,
-                batch_size=args.batch_size,
-                sample_interval_sec=args.interval,
-                num_shards=args.num_shards,
-                shard_id=args.shard_id,
-            )
+        extract_all_siglip_features(
+            output_dir="cache/siglip_features",
+            meta_dir="cache/siglip_meta",
+            device=args.device,
+            batch_size=args.batch_size,
+            num_workers=1,
+            max_gap_sec=args.max_gap_sec,
+            min_gap_sec=args.min_gap_sec,
+            preserve_aspect=not args.no_aspect,
+            num_shards=1,
+            shard_id=0,
+            specific_video_path=args.video_sample,
+        )
     else:
         extract_all_siglip_features(
             device=args.device,
             batch_size=args.batch_size,
-            sample_interval_sec=args.interval,
+            num_workers=args.num_workers,
+            max_gap_sec=args.max_gap_sec,
+            min_gap_sec=args.min_gap_sec,
+            preserve_aspect=not args.no_aspect,
             num_shards=args.num_shards,
             shard_id=args.shard_id,
         )
