@@ -45,10 +45,13 @@ class SigLIPEncoder:
         print(f"[SigLIPEncoder] Loading {model_name} on {self.device} (FP16={self.use_fp16})...")
         try:
             self.processor = AutoImageProcessor.from_pretrained(model_name, local_files_only=True)
-            self.model = SiglipVisionModel.from_pretrained(model_name, local_files_only=True, torch_dtype=torch.float16 if self.use_fp16 else torch.float32)
+            self.model = SiglipVisionModel.from_pretrained(model_name, local_files_only=True, low_cpu_mem_usage=False)
         except Exception:
             self.processor = AutoImageProcessor.from_pretrained(model_name)
-            self.model = SiglipVisionModel.from_pretrained(model_name, torch_dtype=torch.float16 if self.use_fp16 else torch.float32)
+            self.model = SiglipVisionModel.from_pretrained(model_name, low_cpu_mem_usage=False)
+
+        if self.use_fp16:
+            self.model = self.model.half()
 
         self.model.to(self.device)
         self.model.eval()
