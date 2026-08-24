@@ -101,4 +101,9 @@ kaggle_zips/*
 kaggle_uploads/
 kaggle_uploads/*
 
+output/
+output/*
+sig_log
+
 debug_outputs/
+

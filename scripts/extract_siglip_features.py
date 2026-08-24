@@ -240,9 +240,12 @@ def extract_all_siglip_features(
     num_shards: int = 1,
     shard_id: int = 0,
     specific_video_path: Optional[str] = None,
+    exclude_list_path: Optional[str] = "manifests/encoded_siglip_videos.txt",
 ):
     """
     Main extraction orchestrator:
+    - Excludes previously completed videos from the corpus before sharding.
+    - Evenly divides remaining unencoded work across available GPU shards.
     - Multi-process CPU pool handles decoding, gap-filling, and bicubic padding.
     - Main process executes batch FP16 GPU inference on SigLIP-SO400M.
     - Saves L2-normalized 1152-dim numpy arrays atomically.
@@ -261,6 +264,18 @@ def extract_all_siglip_features(
     else:
         video_files = sorted(glob.glob(os.path.join(videos_root, "Videos_L*", "video", "*.mp4")))
     total_all = len(video_files)
+
+    # Exclude previously encoded videos before sharding so remaining work is split 50/50
+    exclude_set = set()
+    if exclude_list_path and os.path.exists(exclude_list_path):
+        with open(exclude_list_path, "r", encoding="utf-8") as f:
+            exclude_set = set(line.strip() for line in f if line.strip())
+        print(f"[*] Loaded {len(exclude_set)} previously encoded videos from {exclude_list_path}.")
+
+    if exclude_set:
+        video_files = [f for f in video_files if os.path.splitext(os.path.basename(f))[0] not in exclude_set]
+
+    total_remaining = len(video_files)
     if num_shards > 1:
         video_files = [f for idx, f in enumerate(video_files) if idx % num_shards == shard_id]
 
@@ -270,8 +285,8 @@ def extract_all_siglip_features(
                 and os.path.exists(os.path.join(meta_dir, f"{os.path.splitext(os.path.basename(f))[0]}.json")))
     ]
 
-    print(f"[*] Found {len(video_files)}/{total_all} videos (Shard {shard_id}/{num_shards}).")
-    print(f"[*] {len(video_files) - len(pending)} already cached. Processing {len(pending)} pending videos with {num_workers} CPU workers.")
+    print(f"[*] Assigned {len(video_files)}/{total_remaining} remaining videos to Shard {shard_id}/{num_shards} (Total corpus: {total_all}).")
+    print(f"[*] {len(video_files) - len(pending)} already cached on disk. Processing {len(pending)} pending videos with {num_workers} CPU workers.")
 
     if not pending:
         print("[✓] All videos already extracted.")
@@ -298,10 +313,21 @@ def extract_all_siglip_features(
 
     total_frames_extracted = 0
     t0 = time.time()
+    processed_count = 0
 
     with tqdm(total=len(pending), desc=f"Extracting SigLIP (Shard {shard_id}/{num_shards})") as pbar:
-        for _ in range(len(pending)):
-            vid_path, frames_rgb, meta_list = out_queue.get()
+        while processed_count < len(pending):
+            try:
+                item = out_queue.get(timeout=2.0)
+            except Exception:
+                # Check if all worker processes are dead
+                alive_workers = [w for w in workers if w.is_alive()]
+                if not alive_workers and out_queue.empty():
+                    print("\n[!] All workers terminated. Exiting queue loop cleanly.")
+                    break
+                continue
+
+            vid_path, frames_rgb, meta_list = item
             vid_name = os.path.splitext(os.path.basename(vid_path))[0]
             out_npy = os.path.join(output_dir, f"{vid_name}.npy")
             out_meta = os.path.join(meta_dir, f"{vid_name}.json")
@@ -317,14 +343,35 @@ def extract_all_siglip_features(
                 os.replace(tmp_meta, out_meta)
                 total_frames_extracted += len(meta_list)
 
+            processed_count += 1
             pbar.update(1)
 
     for w in workers:
-        w.join(timeout=2.0)
+        if w.is_alive():
+            w.terminate()
+        w.join(timeout=1.0)
 
     elapsed = time.time() - t0
-    print(f"\n[✓] SigLIP Extraction complete! Processed {len(pending)} videos ({total_frames_extracted} frames) "
-          f"in {elapsed / 60:.2f} mins ({len(pending) / max(0.1, elapsed):.2f} vids/sec).")
+    print(f"\n[✓] SigLIP Extraction complete! Processed {processed_count}/{len(pending)} videos ({total_frames_extracted} frames) "
+          f"in {elapsed / 60:.2f} mins ({processed_count / max(0.1, elapsed):.2f} vids/sec).")
+
+    # Automatically archive into a single tar.gz for fast, reliable single-stream download
+    try:
+        import tarfile
+        tar_dir = os.path.abspath(os.path.join(output_dir, ".."))
+        tar_path = os.path.join(tar_dir, f"siglip_features_shard_{shard_id}.tar.gz")
+        print(f"[*] Creating single download archive: {tar_path}...")
+        with tarfile.open(tar_path, "w:gz") as tar:
+            if os.path.exists(output_dir):
+                tar.add(output_dir, arcname="siglip_features")
+            if os.path.exists(meta_dir):
+                tar.add(meta_dir, arcname="siglip_meta")
+        print(f"[✓] Archive created: {tar_path} ({os.path.getsize(tar_path) / (1024*1024):.2f} MB)")
+    except Exception as e:
+        print(f"[!] Warning: Failed to create automatic archive ({e}).")
+
+    sys.stdout.flush()
+    sys.stderr.flush()
 
 
 if __name__ == "__main__":
@@ -338,6 +385,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-shards", type=int, default=1, help="Total GPU shards.")
     parser.add_argument("--shard-id", type=int, default=0, help="Shard index (0-indexed).")
     parser.add_argument("--video-sample", type=str, default=None, help="Extract a single test video.")
+    parser.add_argument("--exclude-list", type=str, default="manifests/encoded_siglip_videos.txt", help="Path to text file containing completed video IDs")
     args = parser.parse_args()
 
     if args.video_sample:
@@ -353,6 +401,7 @@ if __name__ == "__main__":
             num_shards=1,
             shard_id=0,
             specific_video_path=args.video_sample,
+            exclude_list_path=None,
         )
     else:
         extract_all_siglip_features(
@@ -364,4 +413,8 @@ if __name__ == "__main__":
             preserve_aspect=not args.no_aspect,
             num_shards=args.num_shards,
             shard_id=args.shard_id,
+            exclude_list_path=args.exclude_list,
         )
+    sys.exit(0)
+
+

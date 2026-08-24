@@ -130,8 +130,9 @@ def extract_query_representations(engine: SearchEngine, query: str, asr_window_s
                     st = cand["start_sec"]
                     et = cand["end_sec"]
                     raw_s = cand.get("rerank_score", cand.get("score", 0.0))
+                    # Single-sigmoid BGE normalization (BGEReranker output is already in [0, 1])
                     if "rerank_score" in cand:
-                        norm_s = 1.0 / (1.0 + math.exp(-float(raw_s)))
+                        norm_s = float(np.clip(raw_s, 0.0, 1.0))
                     else:
                         norm_s = float(np.clip((raw_s - 0.70) / 0.20, 0.0, 1.0))
 
@@ -157,7 +158,7 @@ def extract_query_representations(engine: SearchEngine, query: str, asr_window_s
     return norm_dense_scores, keyframe_asr_scores
 
 
-def evaluate_dataset(engine: SearchEngine, dataset_path: str, dataset_name: str) -> Dict[str, Any]:
+def evaluate_dataset(engine: SearchEngine, dataset_path: str, dataset_name: str, dataset_key: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     print(f"\n================================================================================")
     print(f"  RUNNING BENCHMARK ON: {dataset_name}")
     print(f"  Source file: {dataset_path}")
@@ -185,8 +186,10 @@ def evaluate_dataset(engine: SearchEngine, dataset_path: str, dataset_name: str)
         for name, _, _ in CONFIGS
     }
 
+    per_query_records = []
     t0 = time.time()
     for idx, item in enumerate(queries, 1):
+        q_id = item.get("query_id", f"q_{idx:06d}")
         q_text = item["query"]
         cat = item.get("category", "UNKNOWN")
         gt_list = item.get("relevant_segments", [])
@@ -194,13 +197,42 @@ def evaluate_dataset(engine: SearchEngine, dataset_path: str, dataset_name: str)
         # 1. Compute exact multimodal scores once
         norm_dense, norm_asr = extract_query_representations(engine, q_text, asr_window_sec=5.0)
 
+        # Route query intent with Evidence-Gated Prior
+        intent = engine.classify_query_intent(q_text)
+        max_asr = float(np.max(norm_asr)) if len(norm_asr) > 0 else 0.0
+        
+        if intent.get("category") == "visual_entity_text_grounded":
+            adaptive_wd, adaptive_wa = 0.25, 0.75
+        elif intent.get("category") == "speech_dialogue_grounded":
+            adaptive_wd, adaptive_wa = 0.20, 0.80
+        elif max_asr >= 0.50:
+            # Strong transcript/speech match detected
+            adaptive_wd, adaptive_wa = 0.30, 0.70
+        else:
+            # Transcript match is absent/weak -> visual prior
+            adaptive_wd, adaptive_wa = 0.70, 0.30
+
+        query_eval_entry = {
+            "query_id": q_id,
+            "dataset": dataset_key,
+            "query": q_text,
+            "gt_category": cat,
+            "predicted_category": intent.get("category", "unknown"),
+            "predicted_confidence": intent.get("confidence", 0.5),
+            "max_asr_score": max_asr,
+            "is_default_fallback": (intent.get("category") == "balanced_multimodal"),
+            "adaptive_weights": {"w_dense": adaptive_wd, "w_asr": adaptive_wa},
+            "metrics": {}
+        }
+
         # 2. Evaluate all configurations instantly
         for name, wd, wa in CONFIGS:
             if wd is None and wa is None:
-                intent = engine.classify_query_intent(q_text)
-                fused = (intent["w_dense"] * norm_dense) + (intent["w_asr"] * norm_asr)
+                eff_wd, eff_wa = adaptive_wd, adaptive_wa
             else:
-                fused = (wd * norm_dense) + (wa * norm_asr)
+                eff_wd, eff_wa = wd, wa
+
+            fused = (eff_wd * norm_dense) + (eff_wa * norm_asr)
 
             k_pool = min(200, len(engine.records))
             top_indices = np.argpartition(fused, -k_pool)[-k_pool:]
@@ -246,6 +278,17 @@ def evaluate_dataset(engine: SearchEngine, dataset_path: str, dataset_name: str)
             results[name]["by_cat"][cat]["r25"].append(r25)
             results[name]["by_cat"][cat]["mrr"].append(mrr)
 
+            query_eval_entry["metrics"][name] = {
+                "first_hit_rank": first_hit,
+                "r1": int(r1),
+                "r5": int(r5),
+                "r10": int(r10),
+                "r25": int(r25),
+                "mrr": float(mrr)
+            }
+
+        per_query_records.append(query_eval_entry)
+
         if idx % 50 == 0 or idx == len(queries):
             print(f"  -> Evaluated {idx}/{len(queries)} queries ({time.time() - t0:.2f}s)...", flush=True)
 
@@ -287,19 +330,20 @@ def evaluate_dataset(engine: SearchEngine, dataset_path: str, dataset_name: str)
                 "MRR": float(np.mean(results[name]["by_cat"][cat]["mrr"])),
             }
 
-    return summary
+    return summary, per_query_records
 
 
 def main():
     asr_benchmark_path = "eval/vietnamese_retrieval_benchmark_stage2_rigorous.jsonl"
     vis_benchmark_path = "eval/visual_benchmark_from_raw_frames_1024x576.jsonl"
     out_json_path = "eval/dual_benchmark_results_summary.json"
+    out_breakdown_path = "eval/query_routing_breakdown.jsonl"
 
     print("[*] Initializing SearchEngine...")
     engine = SearchEngine()
 
-    asr_summary = evaluate_dataset(engine, asr_benchmark_path, "ASR-Focused Benchmark (Transcript-Derived)")
-    vis_summary = evaluate_dataset(engine, vis_benchmark_path, "Visual-Focused Benchmark (Raw Frame-Derived 1024x576)")
+    asr_summary, asr_query_records = evaluate_dataset(engine, asr_benchmark_path, "ASR-Focused Benchmark (Transcript-Derived)", "asr_focused")
+    vis_summary, vis_query_records = evaluate_dataset(engine, vis_benchmark_path, "Visual-Focused Benchmark (Raw Frame-Derived 1024x576)", "visual_focused")
 
     final_report = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -311,7 +355,13 @@ def main():
     with open(out_json_path, "w", encoding="utf-8") as f:
         json.dump(final_report, f, ensure_ascii=False, indent=2)
 
-    print(f"\n[✓] Dual benchmark evaluation complete! Saved structured results to {out_json_path}\n")
+    all_records = asr_query_records + vis_query_records
+    with open(out_breakdown_path, "w", encoding="utf-8") as f:
+        for rec in all_records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    print(f"\n[✓] Dual benchmark evaluation complete! Saved structured results to {out_json_path}")
+    print(f"[✓] Saved {len(all_records)} query breakdown logs to {out_breakdown_path}\n")
 
     for report_name, b_data in [("ASR-FOCUSED BENCHMARK (627 QUERIES)", asr_summary), ("VISUAL-FOCUSED BENCHMARK (800 QUERIES)", vis_summary)]:
         print(f"{'='*85}")

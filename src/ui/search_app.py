@@ -895,7 +895,7 @@ class SearchEngine:
             return {
                 "category": "visual_entity_text_grounded",
                 "w_dense": 0.25,
-                "w_asr": 0.15,
+                "w_asr": 0.75,
                 "w_ocr": 0.60,
                 "confidence": 0.90 if has_quotes else 0.80
             }
@@ -918,8 +918,8 @@ class SearchEngine:
         if has_visual_kw:
             return {
                 "category": "visual_scene_object",
-                "w_dense": 0.80,
-                "w_asr": 0.20,
+                "w_dense": 0.70,
+                "w_asr": 0.30,
                 "w_ocr": 0.0,
                 "confidence": 0.80
             }
@@ -1116,10 +1116,9 @@ class SearchEngine:
                         et = cand["end_sec"]
                         txt = cand.get("text", "")
                         raw_s = cand.get("rerank_score", cand.get("score", 0.0))
-                        # Absolute E5 / BGE rerank score calibration
+                        # Absolute E5 / BGE rerank score calibration (BGEReranker already produces calibrated sigmoid probabilities)
                         if "rerank_score" in cand:
-                            # BGE logits passed through sigmoid
-                            norm_s = 1.0 / (1.0 + math.exp(-float(raw_s)))
+                            norm_s = float(np.clip(raw_s, 0.0, 1.0))
                         else:
                             # E5 cosine similarity mapped from [0.70, 0.90] -> [0.0, 1.0]
                             norm_s = float(np.clip((raw_s - 0.70) / 0.20, 0.0, 1.0))
@@ -1149,7 +1148,20 @@ class SearchEngine:
                                 if not keyframe_asr_texts.get(k_idx):
                                     keyframe_asr_texts[k_idx] = txt
 
-        # --- C. Multi-Modal Fusion ---
+        # --- C. Multi-Modal Fusion (Evidence-Gated Routing) ---
+        if is_default_weights:
+            max_asr = float(np.max(keyframe_asr_scores)) if len(keyframe_asr_scores) > 0 else 0.0
+            if detected_category == "visual_entity_text_grounded":
+                eff_w_dense, eff_w_asr = 0.25, 0.75
+            elif detected_category == "speech_dialogue_grounded":
+                eff_w_dense, eff_w_asr = 0.20, 0.80
+            elif max_asr >= 0.50:
+                # Strong transcript/speech evidence detected (BM25 or dense BGE)
+                eff_w_dense, eff_w_asr = 0.30, 0.70
+            else:
+                # Transcript evidence absent/weak -> visual-dominant prior
+                eff_w_dense, eff_w_asr = 0.70, 0.30
+
         fused_scores = (eff_w_dense * norm_dense_scores) + (eff_w_asr * keyframe_asr_scores)
         if keywords:
             fused_scores += self._compute_keyword_scores(keywords, eff_w_dense, eff_w_asr, keyframe_asr_texts)
