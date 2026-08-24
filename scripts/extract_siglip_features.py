@@ -81,13 +81,14 @@ def extract_hybrid_keyframes_from_video(
     """
     vid_name = os.path.splitext(os.path.basename(vid_path))[0]
     raw_iframes = []
-    sampling_method = "pyav_hybrid_adaptive"
+    sampling_method = "pyav_fast_keyframes"
 
     try:
         import av
         container = av.open(vid_path)
         stream = container.streams.video[0]
         stream.codec_context.skip_frame = "NONKEY"
+        stream.codec_context.thread_count = 4
 
         fps = float(stream.average_rate) if stream.average_rate else 30.0
         time_base = float(stream.time_base) if stream.time_base else (1.0 / fps)
@@ -102,31 +103,7 @@ def extract_hybrid_keyframes_from_video(
         container.close()
 
         raw_iframes.sort(key=lambda x: x[0])
-
-        # Gap filling for intervals > max_gap_sec
-        gap_frames = []
-        if len(raw_iframes) > 1:
-            needed_gap_pts = []
-            for i in range(len(raw_iframes) - 1):
-                t_start = raw_iframes[i][0]
-                t_end = raw_iframes[i + 1][0]
-                if (t_end - t_start) > max_gap_sec:
-                    cur_t = t_start + 1.5
-                    while cur_t < (t_end - 0.5):
-                        needed_gap_pts.append(cur_t)
-                        cur_t += 1.5
-
-            if needed_gap_pts:
-                cap = cv2.VideoCapture(vid_path)
-                for g_pts in needed_gap_pts:
-                    cap.set(cv2.CAP_PROP_POS_MSEC, g_pts * 1000.0)
-                    ret, f_arr = cap.read()
-                    if ret:
-                        rgb = cv2.cvtColor(f_arr, cv2.COLOR_BGR2RGB)
-                        gap_frames.append((g_pts, rgb, False))
-                cap.release()
-
-        all_candidates = sorted(raw_iframes + gap_frames, key=lambda x: x[0])
+        all_candidates = raw_iframes
 
     except Exception:
         # Fallback to robust OpenCV grab-stride sampling
