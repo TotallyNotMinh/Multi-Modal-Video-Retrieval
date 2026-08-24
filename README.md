@@ -2,7 +2,7 @@
 
 An end-to-end, high-throughput multi-modal video retrieval and analysis platform.
 
-The system combines **SigLIP dense visual feature search**, **LLM-refined PhoWhisper ASR speech transcription**, **intfloat/multilingual-e5-large dense semantic text search**, **PaddleOCR on-screen text extraction**, **BM25 inverted lexical indexing**, and an interactive real-time web studio for **KIS (Known-Item Search)**, **Q&A**, and **TRAKE (Temporal Action Event Localization)**.
+The system combines **SigLIP-SO400M dense visual feature search (1152-dim)**, **LLM-refined PhoWhisper ASR speech transcription**, **intfloat/multilingual-e5-large dense semantic text search**, **Hybrid PaddleOCR + VietOCR on-screen text extraction**, **BAAI/bge-reranker-v2-m3 neural cross-encoder reranking**, **BM25 inverted lexical indexing**, and an interactive real-time web studio for **KIS (Known-Item Search)**, **Q&A**, and **TRAKE (Temporal Action Event Localization)**.
 
 ---
 
@@ -20,30 +20,30 @@ flowchart TD
         direction TB
         V["<b>Raw Video Corpus (.mp4)</b><br>873 Videos / 120+ Hours"]:::data
 
-        V -->|I-Frame Extraction| KF["<b>Keyframe Extraction</b><br>177,321 Keyframes"]:::data
+        V -->|PyAV Multithreaded I-Frame Extraction| KF["<b>Keyframe Extraction</b><br>285,024 Keyframes (~1.5s step)"]:::data
         V -->|Silero VAD + PhoWhisper| ASR["<b>Speech ASR</b><br>16,660 Audio Segments"]:::data
-        V -->|EasyOCR / PaddleOCR| OCR["<b>On-Screen OCR Banners</b><br>18,451 Text Detections"]:::data
+        V -->|PaddleOCR DBNet + VietOCR| OCR["<b>On-Screen OCR Banners</b><br>132,579 Text Detections"]:::data
 
-        KF -->|SigLIP SO400M / CLIP| SIG_IDX["<b>Visual Feature Matrix</b><br><code>cache/features_matrix.npy</code> (177k × 512)"]:::offline
+        KF -->|SigLIP SO400M-patch14-384 FP16| SIG_IDX["<b>Visual Feature Matrix</b><br><code>cache/features_matrix.npy</code> (285k × 1152)"]:::offline
         ASR -->|LLM Context Correction| REF_ASR["<b>Refined Transcripts</b><br>Diacritics & Proper Nouns Fixed"]:::offline
         
         REF_ASR -->|E5-Large FP16| E5_IDX["<b>Dense Semantic Index</b><br>FAISS IndexFlatIP (16.6k × 1024)"]:::offline
-        REF_ASR & OCR -->|Robertson-Spärck Jones IDF| BM25_IDX["<b>Inverted BM25 Index</b><br>35,111 Speech & OCR Documents"]:::offline
+        REF_ASR & OCR -->|Robertson-Spärck Jones IDF| BM25_IDX["<b>Inverted BM25 Index</b><br>149,239 Speech & OCR Documents"]:::offline
     end
 
-    subgraph PHASE2 ["<b>PHASE 2: STAGE 1 HYBRID CANDIDATE RETRIEVAL (80–120ms)</b>"]
+    subgraph PHASE2 ["<b>PHASE 2: STAGE 1 HYBRID CANDIDATE RETRIEVAL (40–80ms)</b>"]
         direction TB
         Q["<b>User Natural Language Query (VI / EN)</b>"]:::data
         
-        Q -->|Query Translator & Prompt Ensemble| Q_VIS["<b>Visual Concept Vector</b>"]:::online
-        Q -->|Passage Formatter| Q_E5["<b>E5 Query Vector</b>"]:::online
+        Q -->|Query Translator & Ensemble Prompts| Q_VIS["<b>SigLIP Text Embedding (1152-dim)</b>"]:::online
+        Q -->|Passage Formatter| Q_E5["<b>E5 Query Vector (1024-dim)</b>"]:::online
         Q -->|Lexical Tokenizer| Q_BM25["<b>BM25 Query Tokens</b>"]:::online
 
-        Q_VIS -->|Cosine Dot Product| SCORE_VIS["<b>Visual Dense Scores</b>"]:::online
+        Q_VIS -->|Cosine Dot Product + Per-Query MinMax| SCORE_VIS["<b>Visual Dense Scores</b>"]:::online
         Q_E5 -->|FAISS Semantic Search| SCORE_E5["<b>Speech Semantic Scores</b>"]:::online
         Q_BM25 -->|BM25 Inverted Search| SCORE_BM25["<b>Speech + OCR Lexical Scores</b>"]:::online
 
-        SCORE_VIS & SCORE_E5 & SCORE_BM25 --> FUSE["<b>Calibrated Tri-Modal Fusion & Temporal Smoothing</b><br>• Sigmoidal Soft-Saturation Calibration<br>• ±3.0s Temporal Window Aggregation<br>• Temporal NMS Shot Deduplication"]:::online
+        SCORE_VIS & SCORE_E5 & SCORE_BM25 --> FUSE["<b>Calibrated Multi-Modal Fusion</b><br>• Per-Query Min-Max Normalization<br>• ±5.0s Temporal Window Aggregation<br>• Temporal NMS Shot Deduplication (1.5s)"]:::online
         
         FUSE --> TOP_CANDS["<b>Top 50 Ranked Video Clips & Timestamps</b>"]:::online
     end
@@ -52,38 +52,39 @@ flowchart TD
         direction TB
         TOP_CANDS --> CLIP_PICK["<b>Selected Candidate Video Clip</b><br>[start_sec, end_sec]"]:::stage2
         
-        CLIP_PICK --> VLM["<b>Stage 2 Neural Cross-Encoder & VLM Assistant</b><br>• BGE-Reranker-v2-m3 Evidence Scoring (6.0ms)<br>• 6× 512px Clip Frames + ASR Window + OCR Context<br>• Adversarial Unanswerable Query Detection (TNR 69.1%, TPR 70.6%)"]:::stage2
+        CLIP_PICK --> VLM["<b>Stage 2 Neural Cross-Encoder & VLM Assistant</b><br>• BGE-Reranker-v2-m3 Cross-Encoder Scoring<br>• 6× 512px Clip Frames + ASR Window + OCR Context<br>• Temporal Event Alignment & Subtitle Sync"]:::stage2
         
-        VLM --> OUT_ANS["<b>Verified Answer & Timestamp Grounding</b><br>or <b>'Information Not Present' Abstention</b>"]:::stage2
-        OUT_ANS --> STUDIO["<b>Interactive Multi-Modal Retrieval Studio</b><br><code>http://localhost:8080</code> (Timeline Viewer, Keyframe Flooding, QA)"]:::stage2
+        CLIP_PICK --> STUDIO["<b>Interactive Multi-Modal Retrieval Studio</b><br><code>http://localhost:8080</code> (Timeline Viewer, Keyframe Flooding, QA, TRAKE)"]:::stage2
     end
 
     PHASE1 --> PHASE2 --> PHASE3
 ```
 
-### 1. 🖼️ Dense Visual Search (SigLIP)
-- **Model:** `google/siglip-so400m-patch14-384` / OpenCLIP.
-- **Index:** Matrix dot product over **177,321 keyframe vectors** with cosine normalization.
-- **Prompt Ensembling & Query Translation:** Automatic Vietnamese $\leftrightarrow$ English query expansion and ensemble prompting for visual concepts.
+### 1. 🖼️ Dense Visual Search (SigLIP-SO400M)
+- **Model:** `google/siglip-so400m-patch14-384` (1152-dimensional L2-normalized FP16 embeddings).
+- **Index:** High-throughput matrix dot product and FAISS FlatIP index over **285,024 keyframes** (100% of 873 videos).
+- **Decoupled Architecture:** Dedicated `SiglipVisionModel` (1.3s load time) and `SiglipTextModel` with prompt ensemble generation and automated Vietnamese $\leftrightarrow$ English translation.
+- **Per-Query Normalization:** Clean min-max normalization across candidate keyframes eliminating scale mismatch.
 
 ### 2. 🗣️ Conservative LLM Transcript Refinement
 - **100% Corpus Refinement:** All 873 video transcripts (16,660 segments) processed.
 - **Segment Tagging (`<SEGMENT_i>`):** Strictly preserves temporal boundaries and video start/end timestamps.
-- **Error Correction:** Fixes missing Vietnamese diacritics, broken words, phonetic homophones, and misheard proper nouns without hallucination or stylistic paraphrasing.
+- **Error Correction:** Fixes missing Vietnamese diacritics, phonetic homophones, and misheard proper nouns without hallucination.
 
-### 3. 🧠 Dense Semantic Speech Indexing (Multilingual-E5)
-- **Model:** `intfloat/multilingual-e5-large` (1024-dim, FP16 GPU accelerated).
-- **Index:** `FAISS IndexFlatIP` over all 16,660 refined transcript passages.
-- **Conceptual Matching:** Discovers semantic intent even with zero keyword overlap (e.g., *"miền Tây"* $\leftrightarrow$ *"Đồng bằng sông Cửu Long / Tây Nam Bộ"*).
+### 3. 🧠 Dense Semantic Speech Indexing (Multilingual-E5 & BGE Reranker)
+- **Dense Embedding:** `intfloat/multilingual-e5-large` (1024-dim, FP16 GPU accelerated) indexed in FAISS IndexFlatIP.
+- **Neural Cross-Encoder:** `BAAI/bge-reranker-v2-m3` cross-encoder for fine-grained relevance reranking and context expansion.
 
-### 4. 🔤 Exact Lexical & OCR Search (BM25)
-- **Inverted Index:** Fast inverted index with Robertson-Spärck Jones IDF over refined transcripts and on-screen OCR text.
-- **Named Entity Precision:** Guarantees exact matches for proper nouns, acronyms, license plates, locations, and numbers.
+### 4. 🔤 Hybrid OCR Text Extraction (PaddleOCR + VietOCR)
+- **Two-Stage Architecture:**
+  - **Detection:** PaddleOCR DBNet for fast, high-precision bounding box text detection.
+  - **Recognition:** VietOCR Seq2Seq Transformer for native Vietnamese character and diacritics recognition.
+- **Index Coverage:** Ingests **132,579 merged OCR banner segments** across 873 videos into the unified BM25 index.
 
-### 5. 🎯 Tri-Modal Temporal Fusion & Smoothing
-- **Temporal Alignment:** Maps segment-level transcript scores to video keyframe timelines with $\pm 3\text{s}$ window aggregation.
-- **1D Gaussian Temporal Smoothing:** Smooths scores across continuous scene shots.
-- **Shot Deduplication / NMS:** Deduplicates adjacent keyframes within $\pm 2\text{s}$ in the same video to maximize Recall@K diversity.
+### 5. 🎯 Multi-Modal Fusion & Temporal NMS
+- **Linear Fusion Configurations:** Clean static presets (ASR-Heavy `0.30/0.70`, Balanced `0.70/0.30`, Dense-Heavy `0.85/0.15`) and Binary Evidence Gating.
+- **Temporal Alignment:** Maps segment-level transcript and OCR scores to keyframe timestamps with $\pm 5.0\text{s}$ window aggregation.
+- **Shot Deduplication / NMS:** Temporal NMS across keyframes within $1.5\text{s}$ to maximize Recall@K diversity.
 
 ---
 
@@ -91,45 +92,48 @@ flowchart TD
 
 ```text
 ├── data/                                 # Video datasets and official challenge metadata
-│   ├── Videos_L21_a/video/*.mp4          # Video batches (L21 to L30)
-│   ├── Videos_L22_a/video/*.mp4
+│   ├── Videos_L21_a/video/*.mp4          # Video batches (L21 to L30, 873 videos)
 │   ├── ...
 │   ├── map-keyframes-aic25-b1/           # Keyframe timestamp mapping CSVs (pts_time, fps, frame_idx)
 │   ├── media-info-aic25-b1/              # Video duration, resolution, codecs
 │   └── objects-aic25-b1/                 # Precomputed object detection annotations
 │
 ├── cache/                                # Precomputed feature matrices and indexed metadata
-│   ├── features_matrix.npy               # SigLIP visual embeddings matrix (177k keyframes)
-│   ├── faiss_siglip_meta.pkl             # Global keyframe metadata records
-│   ├── faiss_siglip.index                # Indexed visual vector index
+│   ├── features_matrix.npy               # SigLIP-SO400M visual matrix (285,024 × 1152)
+│   ├── faiss_siglip_meta.pkl             # Global keyframe metadata records (285,024 entries)
+│   ├── faiss_siglip.index                # Indexed visual FAISS FlatIP index
 │   ├── asr_transcripts/                  # 873 raw ASR speech transcript JSON files
 │   ├── asr_transcripts_refined/          # 873 LLM-refined ASR transcript JSON files
-│   ├── transcript_embeddings.npy         # Dense E5-large transcript embeddings (16,660 x 1024)
+│   ├── transcript_embeddings.npy         # Dense E5-large transcript embeddings (16,660 × 1024)
 │   ├── transcript_semantic.index         # FAISS dense vector index for transcripts
 │   ├── transcript_semantic_meta.pkl      # Transcript segment metadata ledger
-│   ├── ocr_text/                         # Extracted on-screen OCR text JSON files
+│   ├── ocr_text/                         # 873 Hybrid PaddleOCR + VietOCR extracted JSON files
 │   └── thumbnails/                       # Extracted/cached frame previews
 │
 ├── scripts/                              # Processing, extraction & indexing scripts
-│   ├── build_transcript_index.py        # Build dense FAISS index with E5-Large over refined transcripts
-│   ├── extract_siglip_features.py        # Extract frame embeddings using SigLIP-SO400M
+│   ├── extract_siglip_features.py        # PyAV multithreaded fast SigLIP-SO400M extractor
+│   ├── run_dual_gpu.sh                   # Standalone dual-GPU orchestrator with disk streaming logs
+│   ├── build_faiss_index.py              # Incremental FAISS builder for SigLIP embeddings
+│   ├── build_transcript_index.py         # Build dense FAISS index with E5-Large over refined transcripts
 │   ├── extract_whisper_asr.py            # Batch audio extraction & PhoWhisper speech transcription
 │   ├── refine_transcripts_qwen.py        # Local Qwen2.5/Qwen3 LLM transcript refinement
-│   ├── run_dual_gpu_refinement.py        # Distributed dual-GPU parallel refinement runner
-│   ├── refine_transcripts_mimo.py        # API-based transcript refinement pipeline
-│   ├── evaluate_candidate_models.py      # LLM ASR transcript refinement arena
-│   ├── extract_ocr.py                    # On-screen text extraction via OCR
+│   ├── extract_ocr.py                    # On-screen text extraction via PaddleOCR + VietOCR
 │   └── share_ngrok.py                    # Public tunnel helper for remote hosting
 │
 ├── src/                                  # Core library modules
-│   ├── encoding/                         # SigLIP vision encoder, E5 transcript encoder
+│   ├── encoding/                         # SigLIP vision encoder, E5 transcript encoder, OCR extractor
 │   ├── index/                            # Frame mapper, semantic indexer, metadata indexer
-│   ├── query/                            # Query translator, prompt ensembling
+│   ├── query/                            # Query translator, prompt ensembling, SigLIP text encoder
 │   ├── retrieval/                        # Tri-modal fusion, hybrid transcript engine, video decoder
 │   └── ui/                               # Search web studio (HTTP server + Tailwind frontend)
 │       └── search_app.py
 │
-└── kaggle_dual_gpu_refinement.ipynb      # Kaggle multi-GPU refinement notebook
+├── eval/                                 # Rigorous dual benchmark suite
+│   ├── fast_dual_benchmark.py            # High-speed vectorized dual benchmark evaluation runner
+│   ├── vietnamese_retrieval_benchmark_stage2_rigorous.jsonl  # 627 ASR/multimodal queries
+│   └── visual_benchmark_from_raw_frames_1024x576.jsonl       # 800 Visual-focused queries
+│
+└── training_notebook.ipynb               # Multi-GPU training and feature extraction notebook
 ```
 
 ---
@@ -231,12 +235,26 @@ python scripts/extract_whisper_asr.py \
     --batch-size 32
 ```
 
-### 4. Extract SigLIP Visual Embeddings
+### 4. Extract SigLIP Visual Embeddings (Fast PyAV Multi-Threaded)
 ```bash
+# Single GPU
 python scripts/extract_siglip_features.py \
-    --model-name google/siglip-so400m-patch14-384 \
+    --device cuda:0 \
     --batch-size 64 \
-    --output cache/features_matrix.npy
+    --num-workers 3
+
+# Dual-GPU Parallel Runner
+bash scripts/run_dual_gpu.sh
+```
+
+### 5. Build Unified FAISS Index
+```bash
+python scripts/build_faiss_index.py
+```
+
+### 6. Run Dual Retrieval Benchmark
+```bash
+python eval/fast_dual_benchmark.py
 ```
 
 ---

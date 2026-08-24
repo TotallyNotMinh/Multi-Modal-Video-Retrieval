@@ -107,3 +107,4 @@ sig_log
 
 debug_outputs/
 
+*.tar.gz

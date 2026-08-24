@@ -320,7 +320,12 @@ class SearchEngine:
         self.bm25.index_ocr(self.ocr_dir)
 
         # 5. Load Models
-        self.encoder = CLIPTextEncoder(device="cuda" if torch.cuda.is_available() else "cpu")
+        dim = self.matrix.shape[1]
+        if dim == 1152:
+            from src.query.text_encoder import SigLIPTextEncoder
+            self.encoder = SigLIPTextEncoder(device="cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.encoder = CLIPTextEncoder(device="cuda" if torch.cuda.is_available() else "cpu")
         self.translator = QueryTranslator(use_online=True)
 
         # 6. Thumbnail Memory + Disk Cache
@@ -1019,20 +1024,15 @@ class SearchEngine:
             sub_matrix = np.column_stack(sub_vectors)
             sub_scores_raw = np.dot(self.matrix, sub_matrix)
 
-            # 1. Absolute-Weighted Min-Max Calibration
+            # 1. Per-Query Min-Max Calibration
             sub_scores_norm = np.zeros_like(sub_scores_raw)
             for c in range(sub_scores_raw.shape[1]):
                 col = sub_scores_raw[:, c]
                 c_min, c_max = float(np.min(col)), float(np.max(col))
-                col_norm = (col - c_min) / max(1e-6, c_max - c_min)
-                # Scale by absolute peak confidence to prevent irrelevant sub-scenes from becoming 1.0
-                col_conf = float(np.clip((c_max - 0.20) / 0.13, 0.15, 1.0))
-                sub_scores_norm[:, c] = col_norm * col_conf
+                sub_scores_norm[:, c] = (col - c_min) / max(1e-6, c_max - c_min)
 
             w_min, w_max = float(np.min(dense_scores_whole)), float(np.max(dense_scores_whole))
             norm_whole = (dense_scores_whole - w_min) / max(1e-6, w_max - w_min)
-            whole_conf = float(np.clip((w_max - 0.20) / 0.13, 0.15, 1.0))
-            norm_whole = norm_whole * whole_conf
 
             # 2. Sub-scene Pooling: 0.70 * max + 0.30 * top-2 mean
             if sub_scores_norm.shape[1] >= 2:
@@ -1048,10 +1048,7 @@ class SearchEngine:
         else:
             d_min, d_max = float(np.min(dense_scores_whole)), float(np.max(dense_scores_whole))
             d_denom = max(1e-6, d_max - d_min)
-            col_norm = (dense_scores_whole - d_min) / d_denom
-            # Absolute confidence weighting on visual CLIP
-            d_conf = float(np.clip((d_max - 0.20) / 0.13, 0.15, 1.0))
-            norm_dense_scores = col_norm * d_conf
+            norm_dense_scores = (dense_scores_whole - d_min) / d_denom
             dense_scores = dense_scores_whole
 
         # --- B. Speech Transcript & OCR Search (BM25 Lexical + E5 Semantic) ---

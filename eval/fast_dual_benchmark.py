@@ -29,18 +29,22 @@ if REPO_ROOT not in sys.path:
 from scripts.eval_retrieval import SearchEngine, is_ground_truth_hit
 
 CONFIGS = [
-    ("Pure Visual Dense (1.0 Dense / 0.0 ASR)", 1.0, 0.0),
-    ("Pure Speech/OCR (0.0 Dense / 1.0 ASR)", 0.0, 1.0),
-    ("Hybrid Baseline (0.70 Dense / 0.30 ASR)", 0.70, 0.30),
-    ("ASR-Heavy Hybrid (0.30 Dense / 0.70 ASR)", 0.30, 0.70),
-    ("Dense-Heavy Hybrid (0.85 Dense / 0.15 ASR)", 0.85, 0.15),
-    ("Adaptive Category Routing (Dynamic Intent)", None, None),
+    ("Pure Visual Dense (1.00 Dense / 0.00 Speech+OCR)", 1.00, 0.00),
+    ("Dense-Heavy Hybrid (0.85 Dense / 0.15 Speech+OCR)", 0.85, 0.15),
+    ("Balanced Hybrid (0.70 Dense / 0.30 Speech+OCR)", 0.70, 0.30),
+    ("Equal Split Hybrid (0.50 Dense / 0.50 Speech+OCR)", 0.50, 0.50),
+    ("ASR-Heavy Hybrid (0.30 Dense / 0.70 Speech+OCR)", 0.30, 0.70),
+    ("Pure Speech/OCR (0.00 Dense / 1.00 Speech+OCR)", 0.00, 1.00),
+    ("Binary Gate (T_speech >= 0.20 -> 0.70/0.30, else Pure Dense)", "binary_0.20", None),
+    ("Binary Gate (T_speech >= 0.30 -> 0.70/0.30, else Pure Dense)", "binary_0.30", None),
+    ("Binary Gate (T_speech >= 0.40 -> 0.70/0.30, else Pure Dense)", "binary_0.40", None),
+    ("Binary Gate (T_speech >= 0.50 -> 0.70/0.30, else Pure Dense)", "binary_0.50", None),
 ]
 
 
 def extract_query_representations(engine: SearchEngine, query: str, asr_window_sec: float = 5.0) -> Tuple[np.ndarray, np.ndarray]:
     """Computes exact SearchEngine dense visual scores and speech/OCR scores for a query."""
-    # --- A. Dense Visual Search (CLIP Multi-Scene + Holistic) ---
+    # --- A. Dense Visual Search (SigLIP Multi-Scene + Holistic) ---
     en_query = engine.translator.translate(query)
     prompts = engine.translator.generate_prompts(en_query)
     q_vec = engine.encoder.encode_text(prompts, ensemble=True)
@@ -57,18 +61,15 @@ def extract_query_representations(engine: SearchEngine, query: str, asr_window_s
         sub_matrix = np.column_stack(sub_vectors)
         sub_scores_raw = np.dot(engine.matrix, sub_matrix)
 
+        # Per-query min-max normalization across keyframe candidates
         sub_scores_norm = np.zeros_like(sub_scores_raw)
         for c in range(sub_scores_raw.shape[1]):
             col = sub_scores_raw[:, c]
             c_min, c_max = float(np.min(col)), float(np.max(col))
-            col_norm = (col - c_min) / max(1e-6, c_max - c_min)
-            col_conf = float(np.clip((c_max - 0.20) / 0.13, 0.15, 1.0))
-            sub_scores_norm[:, c] = col_norm * col_conf
+            sub_scores_norm[:, c] = (col - c_min) / max(1e-6, c_max - c_min)
 
         w_min, w_max = float(np.min(dense_scores_whole)), float(np.max(dense_scores_whole))
         norm_whole = (dense_scores_whole - w_min) / max(1e-6, w_max - w_min)
-        whole_conf = float(np.clip((w_max - 0.20) / 0.13, 0.15, 1.0))
-        norm_whole = norm_whole * whole_conf
 
         if sub_scores_norm.shape[1] >= 2:
             top2_vals = np.partition(sub_scores_norm, -2, axis=1)[:, -2:]
@@ -80,10 +81,7 @@ def extract_query_representations(engine: SearchEngine, query: str, asr_window_s
         norm_dense_scores = (0.35 * norm_whole) + (0.65 * max_sub_pooled)
     else:
         d_min, d_max = float(np.min(dense_scores_whole)), float(np.max(dense_scores_whole))
-        d_denom = max(1e-6, d_max - d_min)
-        col_norm = (dense_scores_whole - d_min) / d_denom
-        d_conf = float(np.clip((d_max - 0.20) / 0.13, 0.15, 1.0))
-        norm_dense_scores = col_norm * d_conf
+        norm_dense_scores = (dense_scores_whole - d_min) / max(1e-6, d_max - d_min)
 
     # --- B. Speech Transcript Search (BM25 Lexical + E5 Semantic) ---
     bm25_hits = engine.bm25.search(query, top_k=300)
@@ -227,7 +225,13 @@ def evaluate_dataset(engine: SearchEngine, dataset_path: str, dataset_name: str,
 
         # 2. Evaluate all configurations instantly
         for name, wd, wa in CONFIGS:
-            if wd is None and wa is None:
+            if isinstance(wd, str) and wd.startswith("binary_"):
+                thresh = float(wd.split("_")[1])
+                if max_asr >= thresh:
+                    eff_wd, eff_wa = 0.70, 0.30
+                else:
+                    eff_wd, eff_wa = 1.00, 0.00
+            elif wd is None and wa is None:
                 eff_wd, eff_wa = adaptive_wd, adaptive_wa
             else:
                 eff_wd, eff_wa = wd, wa
