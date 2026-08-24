@@ -885,10 +885,10 @@ class SearchEngine:
     def classify_query_intent(self, query: str) -> Dict[str, Any]:
         """
         Classifies query intent to dynamically determine optimal fusion routing:
-        - OCR / Text Grounded (Item #2): Boosts OCR BM25 signal (w_dense=0.25, w_asr=0.15, w_ocr=0.60)
-        - Speech / Dialogue Grounded (Item #3): Direct speech signals (w_dense=0.20, w_asr=0.80, w_ocr=0.0)
-        - Visual Objects / Scene: Visual grounding (w_dense=0.80, w_asr=0.20, w_ocr=0.0)
-        - Balanced Multi-modal: Fallback (w_dense=0.50, w_asr=0.50, w_ocr=0.0)
+        - OCR / Text Grounded: Boosts OCR BM25 signal (w_dense=0.25, w_asr=0.75, label='OCR Text')
+        - Speech / Dialogue Grounded: Direct speech signals (w_dense=0.20, w_asr=0.80, label='Dialogue / ASR')
+        - Visual Scene & Action: High visual grounding (w_dense=0.85, w_asr=0.15, label='Visual Action / Scene')
+        - Balanced Multimodal: Fallback (w_dense=0.70, w_asr=0.30, label='Balanced Multimodal')
         """
         q_lower = query.lower()
 
@@ -899,6 +899,7 @@ class SearchEngine:
         if has_quotes or has_ocr_kw:
             return {
                 "category": "visual_entity_text_grounded",
+                "label": "OCR On-Screen Text",
                 "w_dense": 0.25,
                 "w_asr": 0.75,
                 "w_ocr": 0.60,
@@ -906,11 +907,12 @@ class SearchEngine:
             }
 
         # 2. Check Speech / Spoken dialogue cues
-        speech_keywords = r"\b(nói|phát biểu|giọng|chia sẻ|kể về|lời thoại|bàn về|nhắc đến|hỏi|trả lời|phỏng vấn|giảng bài|tư vấn|bình luận|hát|lời bài hát|thuyết minh|tại sao|như thế nào|bao nhiêu)\b"
+        speech_keywords = r"\b(nói|phát biểu|giọng|chia sẻ|kể về|lời thoại|bàn về|nhắc đến|hỏi|trả lời|phỏng vấn|giảng bài|tư vấn|bình luận|hát|lời bài hát|thuyết minh|tại sao|như thế nào|bao nhiêu|hướng dẫn|lời khuyên|giải thích)\b"
         has_speech_kw = bool(re.search(speech_keywords, q_lower))
         if has_speech_kw:
             return {
                 "category": "speech_dialogue_grounded",
+                "label": "Spoken Dialogue (ASR)",
                 "w_dense": 0.20,
                 "w_asr": 0.80,
                 "w_ocr": 0.0,
@@ -918,23 +920,25 @@ class SearchEngine:
             }
 
         # 3. Check Visual scene / object appearance cues
-        visual_keywords = r"\b(mặc áo|màu|đang lái|đang chạy|nhảy|bơi|cười|ngủ|cảnh quay|khung cảnh|bầu trời|biển|núi|nhà|xe|đường phố|căn phòng|bếp|cây|hoa|con mèo|con chó)\b"
+        visual_keywords = r"\b(mặc áo|màu|đang lái|đang chạy|nhảy|bơi|cười|ngủ|cảnh quay|khung cảnh|bầu trời|biển|núi|nhà|xe|đường phố|căn phòng|bếp|cây|hoa|con mèo|con chó|cắt|thái|nấu|xào|rán|luộc|trộn|rót|đổ|thìa|muỗng|đĩa|bát|thớt|dao)\b"
         has_visual_kw = bool(re.search(visual_keywords, q_lower))
         if has_visual_kw:
             return {
                 "category": "visual_scene_object",
-                "w_dense": 0.70,
-                "w_asr": 0.30,
+                "label": "Visual Action & Scene",
+                "w_dense": 0.85,
+                "w_asr": 0.15,
                 "w_ocr": 0.0,
-                "confidence": 0.80
+                "confidence": 0.85
             }
 
         return {
             "category": "balanced_multimodal",
-            "w_dense": 0.50,
-            "w_asr": 0.50,
+            "label": "Balanced Multimodal",
+            "w_dense": 0.70,
+            "w_asr": 0.30,
             "w_ocr": 0.0,
-            "confidence": 0.50
+            "confidence": 0.60
         }
 
     def _decompose_query_subscenes(self, query: str) -> List[str]:
@@ -955,8 +959,9 @@ class SearchEngine:
         self,
         query: str,
         keywords: Optional[List[Dict]] = None,
-        w_dense: float = 0.50,
-        w_asr: float = 0.50,
+        w_dense: Optional[float] = None,
+        w_asr: Optional[float] = None,
+        auto_tune: bool = True,
         top_k: int = 100,
         asr_window_sec: float = 5.0
     ) -> Dict:
@@ -972,38 +977,28 @@ class SearchEngine:
             top_k = 100
 
         try:
-            w_dense = float(w_dense)
-            if not math.isfinite(w_dense):
-                w_dense = 0.50
-        except (ValueError, TypeError):
-            w_dense = 0.50
-
-        try:
-            w_asr = float(w_asr)
-            if not math.isfinite(w_asr):
-                w_asr = 0.50
-        except (ValueError, TypeError):
-            w_asr = 0.50
-
-        try:
             asr_window_sec = max(0.5, min(30.0, float(asr_window_sec)))
         except (ValueError, TypeError):
             asr_window_sec = 5.0
 
-        # Classify query intent and determine adaptive routing weights (Items #2 & #3)
+        # Classify query intent and determine adaptive routing weights
         intent_info = self.classify_query_intent(query)
         detected_category = intent_info["category"]
+        category_label = intent_info.get("label", "Balanced Multimodal")
 
-        # If caller used default weights (0.50/0.50), apply category-adaptive weights
-        is_default_weights = (abs(w_dense - 0.50) < 1e-4 and abs(w_asr - 0.50) < 1e-4)
-        if is_default_weights:
-            eff_w_dense = intent_info["w_dense"]
-            eff_w_asr = intent_info["w_asr"]
-            eff_w_ocr = intent_info["w_ocr"]
+        is_auto = bool(auto_tune or w_dense is None or w_asr is None)
+        if is_auto:
+            eff_w_dense = float(intent_info["w_dense"])
+            eff_w_asr = float(intent_info["w_asr"])
+            eff_w_ocr = float(intent_info.get("w_ocr", 0.0))
         else:
-            eff_w_dense = w_dense
-            eff_w_asr = w_asr
+            try:
+                eff_w_dense = max(0.0, min(1.0, float(w_dense)))
+                eff_w_asr = max(0.0, min(1.0, float(w_asr)))
+            except (ValueError, TypeError):
+                eff_w_dense, eff_w_asr = 0.85, 0.15
             eff_w_ocr = 0.0
+            category_label = "Manual Mode"
 
         # --- A. Dense Visual Search (CLIP Multi-Scene + Holistic) ---
         en_query = self.translator.translate(query)
@@ -1145,18 +1140,13 @@ class SearchEngine:
                                 if not keyframe_asr_texts.get(k_idx):
                                     keyframe_asr_texts[k_idx] = txt
 
-        # --- C. Multi-Modal Fusion (Evidence-Gated Routing) ---
-        if is_default_weights:
+        # --- C. Multi-Modal Fusion (Evidence-Gated Dynamic Tuning) ---
+        if is_auto and detected_category == "balanced_multimodal":
             max_asr = float(np.max(keyframe_asr_scores)) if len(keyframe_asr_scores) > 0 else 0.0
-            if detected_category == "visual_entity_text_grounded":
-                eff_w_dense, eff_w_asr = 0.25, 0.75
-            elif detected_category == "speech_dialogue_grounded":
-                eff_w_dense, eff_w_asr = 0.20, 0.80
-            elif max_asr >= 0.50:
-                # Strong transcript/speech evidence detected (BM25 or dense BGE)
+            if max_asr >= 0.50:
                 eff_w_dense, eff_w_asr = 0.30, 0.70
+                category_label = "Strong Speech Match"
             else:
-                # Transcript evidence absent/weak -> visual-dominant prior
                 eff_w_dense, eff_w_asr = 0.70, 0.30
 
         fused_scores = (eff_w_dense * norm_dense_scores) + (eff_w_asr * keyframe_asr_scores)
@@ -1210,10 +1200,12 @@ class SearchEngine:
             "query_vi": query,
             "translated_query": en_query,
             "detected_category": detected_category,
+            "category_label": category_label,
+            "auto_tuned": is_auto,
             "effective_weights": {
-                "w_dense": eff_w_dense,
-                "w_asr": eff_w_asr,
-                "w_ocr": eff_w_ocr
+                "w_dense": round(eff_w_dense, 2),
+                "w_asr": round(eff_w_asr, 2),
+                "w_ocr": round(eff_w_ocr, 2)
             },
             "sub_scenes": sub_clauses if len(sub_clauses) > 1 else [],
             "asr_window_sec": asr_window_sec,
@@ -1227,8 +1219,9 @@ class SearchEngine:
         query: str,
         marked_items: List[Dict],
         keywords: Optional[List[Dict]] = None,
-        w_dense: float = 0.50,
-        w_asr: float = 0.50,
+        w_dense: Optional[float] = None,
+        w_asr: Optional[float] = None,
+        auto_tune: bool = True,
         top_k: int = 100,
         alpha: float = 0.65,
         beta: float = 0.35,
@@ -1245,19 +1238,22 @@ class SearchEngine:
         except (ValueError, TypeError):
             top_k = 100
 
-        try:
-            w_dense = float(w_dense)
-            if not math.isfinite(w_dense):
-                w_dense = 0.50
-        except (ValueError, TypeError):
-            w_dense = 0.50
+        # Classify query intent if auto_tune enabled
+        intent_info = self.classify_query_intent(query) if query else {"category": "visual_scene_object", "w_dense": 0.85, "w_asr": 0.15, "label": "Visual Feedback"}
+        detected_category = intent_info["category"]
+        category_label = intent_info.get("label", "Balanced Multimodal")
 
-        try:
-            w_asr = float(w_asr)
-            if not math.isfinite(w_asr):
-                w_asr = 0.50
-        except (ValueError, TypeError):
-            w_asr = 0.50
+        is_auto = bool(auto_tune or w_dense is None or w_asr is None)
+        if is_auto:
+            eff_w_dense = float(intent_info["w_dense"])
+            eff_w_asr = float(intent_info["w_asr"])
+        else:
+            try:
+                eff_w_dense = max(0.0, min(1.0, float(w_dense)))
+                eff_w_asr = max(0.0, min(1.0, float(w_asr)))
+            except (ValueError, TypeError):
+                eff_w_dense, eff_w_asr = 0.85, 0.15
+            category_label = "Manual Mode"
 
         try:
             asr_window_sec = max(0.5, min(30.0, float(asr_window_sec)))
@@ -1360,9 +1356,9 @@ class SearchEngine:
                                 keyframe_asr_texts[k_idx] = txt
 
         # 6. Fusion & NMS
-        fused_scores = (w_dense * norm_dense_scores) + (w_asr * keyframe_asr_scores)
+        fused_scores = (eff_w_dense * norm_dense_scores) + (eff_w_asr * keyframe_asr_scores)
         if keywords:
-            fused_scores += self._compute_keyword_scores(keywords, w_dense, w_asr, keyframe_asr_texts)
+            fused_scores += self._compute_keyword_scores(keywords, eff_w_dense, eff_w_asr, keyframe_asr_texts)
 
         k_pool = min(max(top_k * 4, 1), len(self.records))
         top_indices = np.argpartition(fused_scores, -k_pool)[-k_pool:]
@@ -1442,13 +1438,19 @@ class SearchEngine:
         return {
             "query_vi": query,
             "translated_query": en_query,
+            "detected_category": detected_category,
+            "category_label": category_label,
+            "auto_tuned": is_auto,
+            "effective_weights": {
+                "w_dense": round(eff_w_dense, 2),
+                "w_asr": round(eff_w_asr, 2),
+                "w_ocr": 0.0
+            },
             "search_time_ms": search_time_ms,
             "total_results": len(results),
             "results": results
         }
 
-
-ENGINE = None
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en" class="dark">
@@ -1462,8 +1464,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       darkMode: 'class',
       theme: {
         extend: {
+          fontFamily: {
+            sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
+            mono: ['JetBrains Mono', 'Menlo', 'monospace']
+          },
           colors: {
-            brand: { 50: '#ecfdf5', 500: '#10b981', 600: '#059669', 700: '#047857' }
+            brand: { 50: '#f0fdfa', 500: '#14b8a6', 600: '#0d9488', 700: '#0f766e' }
           }
         }
       }
@@ -1472,51 +1478,62 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script>if (typeof JSZip === 'undefined') { document.write('<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"><\/script>'); }</script>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-    body { font-family: 'Inter', sans-serif; }
-    .glass { background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); }
-    ::-webkit-scrollbar { width: 6px; height: 6px; }
-    ::-webkit-scrollbar-track { background: #0f172a; }
-    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+    body { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+    .glass { background: rgba(15, 18, 28, 0.75); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.07); }
+    .glass-subtle { background: rgba(20, 24, 38, 0.55); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.05); }
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: #090b12; }
+    ::-webkit-scrollbar-thumb { background: #262b3d; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #373e57; }
+    input[type="range"]::-webkit-slider-thumb {
+      height: 14px;
+      width: 14px;
+      border-radius: 50%;
+      background: #14b8a6;
+      cursor: pointer;
+      -webkit-appearance: none;
+      box-shadow: 0 0 8px rgba(20, 184, 166, 0.4);
+    }
   </style>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col antialiased selection:bg-brand-500 selection:text-white">
+<body class="bg-[#080a11] text-zinc-100 min-h-screen flex flex-col antialiased selection:bg-teal-500/25 selection:text-teal-200">
 
   <!-- Header -->
-  <header class="sticky top-0 z-40 glass border-b border-slate-800/80 px-6 py-3.5 flex items-center justify-between shadow-2xl">
+  <header class="sticky top-0 z-40 glass border-b border-zinc-800/80 px-6 py-3 flex items-center justify-between shadow-lg">
     <div class="flex items-center gap-3">
-      <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-400 to-teal-600 flex items-center justify-center font-bold text-slate-950 shadow-lg shadow-emerald-500/20">
+      <div class="w-8 h-8 rounded-xl bg-gradient-to-br from-teal-500/20 to-indigo-500/20 border border-teal-500/30 flex items-center justify-center font-bold text-teal-300 text-xs tracking-wider shadow-sm">
         AI
       </div>
       <div>
-        <h1 class="font-bold text-base tracking-tight text-white">
+        <h1 class="font-bold text-sm tracking-tight text-zinc-100">
           AIC 2026 Multi-Modal Retrieval Studio
         </h1>
       </div>
     </div>
 
-    <div class="flex items-center gap-2.5">
+    <div class="flex items-center gap-2">
       <!-- Hidden File Input for Sidebar & Modal Uploads -->
       <input type="file" id="queryFileInput" accept=".zip,.txt,.json" multiple class="hidden" onchange="handleQueryFileUpload(event)" />
 
       <!-- Batch Export ZIP Button -->
-      <button id="exportAllZipBtn" onclick="exportAllQueriesZip()" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-gradient-to-r from-amber-500/20 to-orange-500/20 hover:from-amber-500/30 hover:to-orange-500/30 text-amber-300 border border-amber-500/40 transition flex items-center gap-1.5 shadow-sm" title="Đóng gói toàn bộ đáp án của tất cả các câu truy vấn thành submission.zip">
+      <button id="exportAllZipBtn" onclick="exportAllQueriesZip()" class="text-xs font-medium px-3 py-1.5 rounded-lg bg-zinc-900/90 hover:bg-zinc-800 text-amber-300/90 border border-amber-500/30 transition flex items-center gap-1.5 shadow-sm active:scale-95" title="Đóng gói toàn bộ đáp án của tất cả các câu truy vấn thành submission.zip">
         <span>📦</span>
         <span id="exportAllZipLabel">Export All (.zip)</span>
-        <span id="batchProgressBadge" class="hidden px-1.5 py-0.2 rounded-full bg-amber-400 text-slate-950 font-mono text-[10px] font-bold">0/0</span>
+        <span id="batchProgressBadge" class="hidden px-1.5 py-0.2 rounded-full bg-amber-400/20 text-amber-300 font-mono text-[10px] font-bold border border-amber-400/30">0/0</span>
       </button>
 
       <!-- VLM Model & Assistant Launch Button -->
-      <button onclick="toggleChatbot()" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-gradient-to-r from-emerald-500/20 to-teal-500/20 hover:from-emerald-500/30 hover:to-teal-500/30 text-emerald-300 border border-emerald-500/40 transition flex items-center gap-1.5 shadow-sm" title="Mở Trợ lý VLM phân tích video & clip">
-        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-        <span class="font-bold">🤖 VLM</span>
-        <span id="headerModelBadge" class="font-mono text-[10px] px-1.5 py-0.5 rounded bg-slate-900 text-emerald-400 border border-slate-700">minimax/minimax-m3</span>
+      <button onclick="toggleChatbot()" class="text-xs font-medium px-3 py-1.5 rounded-lg bg-zinc-900/90 hover:bg-zinc-800 text-teal-300 border border-teal-500/30 transition flex items-center gap-1.5 shadow-sm active:scale-95" title="Mở Trợ lý VLM phân tích video & clip">
+        <span class="w-1.5 h-1.5 rounded-full bg-teal-400 animate-pulse"></span>
+        <span class="font-semibold">VLM</span>
+        <span id="headerModelBadge" class="font-mono text-[10px] px-1.5 py-0.5 rounded bg-zinc-950 text-zinc-400 border border-zinc-800">minimax/minimax-m3</span>
       </button>
 
-      <div class="flex items-center gap-1.5 bg-slate-900/80 px-2 py-1 rounded-lg border border-slate-700/60">
-        <span class="text-[11px] text-slate-400 font-semibold">Query ID:</span>
-        <input id="queryIdInput" type="text" value="query-1" placeholder="query-1" class="w-20 bg-slate-950 text-emerald-300 font-mono text-xs rounded px-1.5 py-1 border border-slate-700 focus:outline-none" oninput="updateExportButtonLabel()" />
-        <button id="exportCsvBtn" onclick="exportCSV()" class="text-xs font-semibold px-2.5 py-1 rounded bg-emerald-500 hover:bg-emerald-400 text-slate-950 transition flex items-center gap-1 shadow-sm font-bold" title="Xuất file CSV riêng cho câu query hiện tại">
+      <div class="flex items-center gap-1.5 bg-zinc-900/90 px-2 py-1 rounded-lg border border-zinc-800">
+        <span class="text-[11px] text-zinc-400 font-medium">Query:</span>
+        <input id="queryIdInput" type="text" value="query-1" placeholder="query-1" class="w-20 bg-zinc-950 text-teal-300 font-mono text-xs rounded px-1.5 py-0.5 border border-zinc-800 focus:outline-none focus:border-teal-500/50" oninput="updateExportButtonLabel()" />
+        <button id="exportCsvBtn" onclick="exportCSV()" class="text-xs font-semibold px-2.5 py-1 rounded-md bg-teal-600 hover:bg-teal-500 text-zinc-950 transition flex items-center gap-1 shadow-sm active:scale-95" title="Xuất file CSV riêng cho câu query hiện tại">
           <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
           <span id="exportBtnLabel">Export KIS</span>
         </button>
@@ -1528,39 +1545,39 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="flex-1 w-full max-w-[1720px] mx-auto p-4 md:p-6 flex flex-col md:flex-row gap-6 items-start">
 
     <!-- Persistent Left Queries Sidebar (Always Visible) -->
-    <aside id="querySidebar" class="w-full md:w-80 lg:w-[370px] flex-shrink-0 bg-[#080b14]/95 backdrop-blur-xl rounded-2xl p-4 shadow-2xl border border-slate-800/80 flex flex-col gap-3.5 md:sticky md:top-20 max-h-[calc(100vh-6rem)] overflow-hidden z-50 relative">
+    <aside id="querySidebar" class="w-full md:w-80 lg:w-[360px] flex-shrink-0 bg-[#0c0e18]/95 backdrop-blur-xl rounded-2xl p-4 shadow-xl border border-zinc-800/80 flex flex-col gap-3.5 md:sticky md:top-16 max-h-[calc(100vh-5.5rem)] overflow-hidden z-30 relative">
       
       <!-- Sidebar Header -->
-      <div class="flex items-center justify-between border-b border-slate-800/70 pb-3">
-        <div class="flex items-center gap-3 min-w-0">
-          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white shadow-lg shadow-indigo-500/25 flex-shrink-0">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <div class="flex items-center justify-between border-b border-zinc-800/70 pb-3">
+        <div class="flex items-center gap-2.5 min-w-0">
+          <div class="w-8 h-8 rounded-xl bg-zinc-800/80 border border-zinc-700/60 flex items-center justify-center text-zinc-300 shadow-sm flex-shrink-0">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
             </svg>
           </div>
           <div class="min-w-0 flex-1">
-            <h2 class="font-extrabold text-sm tracking-tight text-white uppercase font-sans">
-              AIC 2026 STUDIO
+            <h2 class="font-bold text-xs tracking-wider text-zinc-200 uppercase font-mono">
+              QUERY SESSION
             </h2>
           </div>
         </div>
 
         <div class="flex items-center gap-1">
-          <button onclick="document.getElementById('queryFileInput').click()" class="p-1.5 bg-slate-900/80 hover:bg-slate-800 text-sky-400 border border-slate-800 rounded-lg text-xs transition" title="Upload Queries (.zip / .txt)">
+          <button onclick="document.getElementById('queryFileInput').click()" class="p-1.5 bg-zinc-900/80 hover:bg-zinc-800 text-teal-400 border border-zinc-800 rounded-lg text-xs transition" title="Upload Queries (.zip / .txt)">
             ➕
           </button>
-          <button onclick="resetSessionStorage()" class="p-1.5 bg-slate-900/80 hover:bg-amber-950/50 text-amber-400 border border-slate-800 rounded-lg text-xs transition" title="Reset Session">
+          <button onclick="resetSessionStorage()" class="p-1.5 bg-zinc-900/80 hover:bg-zinc-800 text-zinc-400 hover:text-amber-400 border border-zinc-800 rounded-lg text-xs transition" title="Reset Session">
             🧹
           </button>
         </div>
       </div>
 
       <!-- Filter Controls: Search Bar + Mode Tabs -->
-      <div class="flex flex-col gap-2.5">
+      <div class="flex flex-col gap-2">
         <!-- Search Input -->
         <div class="relative flex items-center">
-          <div class="absolute left-3 text-slate-500 pointer-events-none">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <div class="absolute left-3 text-zinc-500 pointer-events-none">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
             </svg>
           </div>
@@ -1568,49 +1585,49 @@ HTML_PAGE = r"""<!DOCTYPE html>
             id="sidebarFilterInput" 
             type="text" 
             placeholder="Filter queries..." 
-            class="w-full bg-[#0d1222] text-slate-200 placeholder-slate-500 text-xs rounded-xl pl-9 pr-8 py-2.5 border border-slate-800/80 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/40 transition font-medium"
+            class="w-full bg-[#080a12] text-zinc-200 placeholder-zinc-500 text-xs rounded-xl pl-8 pr-7 py-2 border border-zinc-800/80 focus:outline-none focus:border-zinc-600 focus:ring-1 focus:ring-zinc-600/30 transition font-medium"
             oninput="filterSidebarQueries(this.value)"
           />
-          <button id="sidebarFilterClearBtn" onclick="clearSidebarFilter()" class="hidden absolute right-2.5 text-slate-500 hover:text-slate-300 text-xs font-bold px-1">
+          <button id="sidebarFilterClearBtn" onclick="clearSidebarFilter()" class="hidden absolute right-2.5 text-zinc-500 hover:text-zinc-300 text-xs font-bold px-1">
             ✕
           </button>
         </div>
 
         <!-- Filter Tabs Row -->
         <div class="flex items-center justify-between gap-1 text-xs">
-          <button id="filterTab_all" onclick="setSidebarModeFilter('all')" class="flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold bg-slate-800 text-white border border-slate-700 shadow-sm">
+          <button id="filterTab_all" onclick="setSidebarModeFilter('all')" class="flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold bg-zinc-800 text-zinc-100 border border-zinc-700 shadow-sm">
             All (<span id="count_all">0</span>)
           </button>
-          <button id="filterTab_kis" onclick="setSidebarModeFilter('kis')" class="flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-sky-400 hover:bg-slate-900/60">
+          <button id="filterTab_kis" onclick="setSidebarModeFilter('kis')" class="flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold text-zinc-400 hover:text-teal-300 hover:bg-zinc-900/60">
             KIS (<span id="count_kis">0</span>)
           </button>
-          <button id="filterTab_qa" onclick="setSidebarModeFilter('qa')" class="flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-purple-400 hover:bg-slate-900/60">
+          <button id="filterTab_qa" onclick="setSidebarModeFilter('qa')" class="flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold text-zinc-400 hover:text-purple-300 hover:bg-zinc-900/60">
             QA (<span id="count_qa">0</span>)
           </button>
-          <button id="filterTab_trake" onclick="setSidebarModeFilter('trake')" class="flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-amber-400 hover:bg-slate-900/60">
+          <button id="filterTab_trake" onclick="setSidebarModeFilter('trake')" class="flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold text-zinc-400 hover:text-amber-300 hover:bg-zinc-900/60">
             TRAKE (<span id="count_trake">0</span>)
           </button>
         </div>
       </div>
 
       <!-- Scrollable Query Cards List (Always Visible on Side) -->
-      <div id="queryCardsContainer" class="flex-1 overflow-y-auto flex flex-col gap-2.5 pr-1 min-h-[140px]">
+      <div id="queryCardsContainer" class="flex-1 overflow-y-auto flex flex-col gap-2 pr-1 min-h-[140px]">
         <!-- Empty State -->
-        <div id="querySidebarEmptyState" class="py-12 text-center text-slate-500 text-xs flex flex-col items-center gap-2">
-          <span class="text-3xl">📂</span>
+        <div id="querySidebarEmptyState" class="py-12 text-center text-zinc-500 text-xs flex flex-col items-center gap-2">
+          <span class="text-2xl">📂</span>
           <span>Chưa có gói câu hỏi nào.</span>
-          <button onclick="document.getElementById('queryFileInput').click()" class="mt-1 px-3 py-1.5 bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-500/40 rounded-lg text-xs font-semibold transition">
+          <button onclick="document.getElementById('queryFileInput').click()" class="mt-1 px-3 py-1.5 bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 border border-teal-500/30 rounded-lg text-xs font-medium transition">
             Upload Queries (.zip)
           </button>
         </div>
       </div>
 
       <!-- Sidebar Bottom Action Buttons -->
-      <div class="border-t border-slate-800/80 pt-3 flex items-center justify-between gap-2">
-        <button onclick="saveActiveQueryResult()" class="flex-1 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl transition flex items-center justify-center gap-1 shadow-md shadow-emerald-500/20">
+      <div class="border-t border-zinc-800/80 pt-3 flex items-center justify-between gap-2">
+        <button onclick="saveActiveQueryResult()" class="flex-1 py-2 bg-teal-600 hover:bg-teal-500 text-zinc-950 font-semibold text-xs rounded-xl transition flex items-center justify-center gap-1 shadow-sm active:scale-95">
           💾 Save Current
         </button>
-        <button onclick="exportAllQueriesZip()" class="flex-1 py-2 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-xs rounded-xl transition flex items-center justify-center gap-1 shadow-md shadow-amber-500/20">
+        <button onclick="exportAllQueriesZip()" class="flex-1 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 font-semibold text-xs rounded-xl transition flex items-center justify-center gap-1 shadow-sm active:scale-95">
           📦 Export ZIP
         </button>
       </div>
@@ -1620,133 +1637,140 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <main class="flex-1 min-w-0 w-full flex flex-col gap-5">
 
       <!-- Task Mode Selector (plan.txt) -->
-      <div class="glass rounded-2xl p-2.5 shadow-xl flex flex-wrap items-center justify-between gap-3 border border-slate-800">
-        <div class="flex items-center gap-1.5 bg-slate-950/90 p-1 rounded-xl border border-slate-800">
-          <button id="modeBtn_kis" onclick="setTaskMode('kis')" class="px-4 py-2 rounded-lg font-bold text-xs transition flex items-center gap-2 bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/20">
+      <div class="glass rounded-2xl p-2.5 shadow-sm flex flex-wrap items-center justify-between gap-3 border border-zinc-800/80">
+        <div class="flex items-center gap-1 bg-zinc-950/80 p-1 rounded-xl border border-zinc-800/80">
+          <button id="modeBtn_kis" onclick="setTaskMode('kis')" class="px-3.5 py-1.5 rounded-lg font-semibold text-xs transition flex items-center gap-1.5 bg-zinc-800 text-teal-300 border border-teal-500/30 shadow-sm">
             <span>🔍</span>
             <span>1. Retrieval (KIS)</span>
           </button>
-          <button id="modeBtn_qa" onclick="setTaskMode('qa')" class="px-4 py-2 rounded-lg font-bold text-xs transition flex items-center gap-2 text-slate-400 hover:text-slate-200">
+          <button id="modeBtn_qa" onclick="setTaskMode('qa')" class="px-3.5 py-1.5 rounded-lg font-semibold text-xs transition flex items-center gap-1.5 text-zinc-400 hover:text-zinc-200">
             <span>💬</span>
             <span>2. Q&A Mode</span>
           </button>
-          <button id="modeBtn_trake" onclick="setTaskMode('trake')" class="px-4 py-2 rounded-lg font-bold text-xs transition flex items-center gap-2 text-slate-400 hover:text-slate-200">
+          <button id="modeBtn_trake" onclick="setTaskMode('trake')" class="px-3.5 py-1.5 rounded-lg font-semibold text-xs transition flex items-center gap-1.5 text-zinc-400 hover:text-zinc-200">
             <span>⏱️</span>
             <span>3. TRAKE Mode</span>
           </button>
         </div>
 
-        <div id="modeDescriptionText" class="text-xs text-slate-400 flex items-center gap-1.5">
-          <span class="text-emerald-400 font-semibold">Mode KIS:</span> Tìm kiếm & xuất file <code class="bg-slate-900 px-1.5 py-0.5 rounded text-emerald-300 font-mono text-[11px]">&lt;query_id&gt;-kis.csv</code> (video_id,frame_idx)
+        <div id="modeDescriptionText" class="text-xs text-zinc-400 flex items-center gap-1.5">
+          <span class="text-teal-400 font-medium">Mode KIS:</span> Tìm kiếm & xuất file <code class="bg-zinc-900 px-1.5 py-0.5 rounded text-teal-300 font-mono text-[11px] border border-zinc-800">&lt;query_id&gt;-kis.csv</code>
         </div>
       </div>
 
     <!-- Search Input Card -->
-    <div class="glass rounded-2xl p-5 shadow-xl flex flex-col gap-4">
+    <div class="glass rounded-2xl p-5 shadow-sm flex flex-col gap-4 border border-zinc-800/80">
 
       <!-- Quick Query Navigator Bar -->
-      <div id="queryActiveBar" class="flex flex-wrap items-center justify-between gap-2 bg-slate-950/80 p-2.5 rounded-xl border border-slate-800 text-xs">
+      <div id="queryActiveBar" class="flex flex-wrap items-center justify-between gap-2 bg-zinc-950/70 p-2 rounded-xl border border-zinc-800/80 text-xs">
         <div class="flex items-center gap-2">
-          <span class="text-sky-400 font-bold flex items-center gap-1">
-            🎯 Active Query:
+          <span class="text-zinc-400 font-medium flex items-center gap-1">
+            Active Query:
           </span>
-          <select id="quickQuerySelector" onchange="selectQuery(this.value, true)" class="bg-slate-900 border border-slate-700 text-slate-200 font-mono text-xs rounded-lg px-2.5 py-1 focus:outline-none focus:border-sky-400 font-semibold">
+          <select id="quickQuerySelector" onchange="selectQuery(this.value, true)" class="bg-zinc-900 border border-zinc-800 text-zinc-200 font-mono text-xs rounded-lg px-2.5 py-1 focus:outline-none focus:border-zinc-600 font-semibold">
             <option value="query-1">query-1 (Default)</option>
           </select>
-          <span id="quickQueryStatusBadge" class="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 font-semibold">
+          <span id="quickQueryStatusBadge" class="text-[10px] px-2 py-0.5 rounded-full bg-zinc-800/80 text-zinc-400 font-medium border border-zinc-700/50">
             ○ Unanswered
           </span>
         </div>
 
-        <div class="flex items-center gap-1.5">
-          <button onclick="cycleQuery(-1)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition" title="Chuyển đến câu query trước">
+        <div class="flex items-center gap-1">
+          <button onclick="cycleQuery(-1)" class="px-2.5 py-1 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 rounded-lg text-xs font-medium border border-zinc-800 transition active:scale-95" title="Chuyển đến câu query trước">
             ⏮️ Prev
           </button>
-          <button onclick="cycleQuery(1)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition" title="Chuyển đến câu query tiếp theo">
+          <button onclick="cycleQuery(1)" class="px-2.5 py-1 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 rounded-lg text-xs font-medium border border-zinc-800 transition active:scale-95" title="Chuyển đến câu query tiếp theo">
             Next ⏭️
           </button>
         </div>
       </div>
 
       <div class="relative flex items-center">
-        <div class="absolute left-4 text-slate-400">
-          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+        <div class="absolute left-3.5 text-zinc-500">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
         </div>
         <input 
           id="queryInput" 
           type="text" 
           placeholder="Nhập mô tả sự kiện (VD: 'Mẩu tin giới thiệu về đàn hổ tại một địa phương ở miền Nam vừa có thêm 3-6 con hổ con', 'ức gà trộn cải ngồng')..." 
-          class="w-full bg-slate-900/90 text-slate-100 placeholder-slate-500 text-sm rounded-xl pl-12 pr-28 py-3.5 border border-slate-700/60 focus:outline-none focus:ring-2 focus:ring-emerald-500/40 focus:border-emerald-500 transition font-medium"
+          class="w-full bg-[#090b12] text-zinc-100 placeholder-zinc-500 text-xs sm:text-sm rounded-xl pl-10 pr-24 py-3 border border-zinc-800 focus:outline-none focus:ring-1 focus:ring-teal-500/40 focus:border-teal-500/50 transition font-medium"
           onkeydown="if(event.key==='Enter') executeSearch()"
         />
         <button 
           onclick="executeSearch()" 
-          class="absolute right-2 px-5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-xs transition shadow-md shadow-emerald-500/20 active:scale-95"
+          class="absolute right-1.5 px-4 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-500 text-zinc-950 font-semibold text-xs transition shadow-sm active:scale-95"
         >
           Search
         </button>
       </div>
 
       <!-- Keyword Emphasis & Exact Match Section -->
-      <div class="flex flex-col gap-2 pt-2 border-t border-slate-800/60 text-xs">
+      <div class="flex flex-col gap-2 pt-2 border-t border-zinc-800/60 text-xs">
         <div class="flex flex-wrap items-center justify-between gap-2">
           <div class="flex items-center gap-2">
-            <span class="text-slate-400 font-semibold flex items-center gap-1">
+            <span class="text-zinc-400 font-medium flex items-center gap-1">
               ⚡ Keywords:
             </span>
             <div class="flex items-center gap-1.5">
               <input 
                 id="newKeywordInput" 
                 type="text" 
-                placeholder="Thêm từ khóa (VD: 'hổ con', 'Lộc Trời', '60 Giây')..." 
-                class="bg-slate-900 text-slate-200 placeholder-slate-500 text-xs rounded-lg px-3 py-1.5 border border-slate-700/60 focus:outline-none focus:ring-1 focus:ring-emerald-500/50 w-64"
+                placeholder="Thêm từ khóa (VD: 'hổ con', 'Lộc Trời')..." 
+                class="bg-[#090b12] text-zinc-200 placeholder-zinc-500 text-xs rounded-lg px-2.5 py-1.5 border border-zinc-800 focus:outline-none focus:border-zinc-600 w-56"
                 onkeydown="if(event.key==='Enter') addKeyword(true)"
               />
               <button 
                 onclick="addKeyword(true)" 
-                class="px-2.5 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 font-semibold text-xs border border-amber-500/40 transition flex items-center gap-1"
+                class="px-2.5 py-1.5 rounded-lg bg-sky-500/10 hover:bg-sky-500/20 text-sky-300 font-medium text-xs border border-sky-500/30 transition flex items-center gap-1"
                 title="Exact keyword/phrase substring match on transcript without neural CLIP encoding"
               >
-                🔤 + Exact Match
+                🔤 + Exact
               </button>
               <button 
                 onclick="addKeyword(false)" 
-                class="px-2.5 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 font-semibold text-xs border border-emerald-500/30 transition flex items-center gap-1"
+                class="px-2.5 py-1.5 rounded-lg bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 font-medium text-xs border border-teal-500/30 transition flex items-center gap-1"
                 title="Semantic visual CLIP + speech BM25 match"
               >
                 🧠 + Semantic
               </button>
             </div>
           </div>
-          <span class="text-[11px] text-slate-500"><b>Exact Match</b> searches direct text/speech transcripts with 0% semantic drift.</span>
+          <span class="text-[11px] text-zinc-500"><b>Exact Match</b> searches speech transcripts with 0% semantic drift.</span>
         </div>
         <div id="keywordChipsContainer" class="flex flex-wrap gap-2 pt-0.5"></div>
       </div>
 
       <!-- Live Controls & Query Translation Info -->
-      <div class="flex flex-wrap items-center justify-between gap-4 pt-1 border-t border-slate-800/60 text-xs">
-        <div class="flex items-center gap-2 text-slate-400">
-          <span>Translated English Query:</span>
-          <span id="transQuery" class="text-emerald-300 font-mono bg-emerald-950/40 px-2.5 py-1 rounded border border-emerald-800/40 italic">None</span>
+      <div class="flex flex-wrap items-center justify-between gap-3 pt-1 border-t border-zinc-800/60 text-xs">
+        <div class="flex items-center gap-2 text-zinc-400">
+          <span>Translated:</span>
+          <span id="transQuery" class="text-teal-300 font-mono bg-zinc-900/80 px-2.5 py-0.5 rounded border border-zinc-800 text-[11px] italic">None</span>
         </div>
 
-        <div class="flex items-center gap-6">
-          <div class="flex items-center gap-2">
-            <span class="text-slate-400">Visual (CLIP):</span>
-            <input id="wDense" type="range" min="0" max="1" step="0.05" value="0.50" class="w-20 accent-emerald-500" oninput="updateWeights()">
-            <span id="wDenseVal" class="text-slate-300 font-mono w-7">0.50</span>
+        <div class="flex items-center gap-3">
+          <!-- Single Unified Balance Slider (Visual vs Speech/OCR) -->
+          <div class="flex items-center gap-2.5 bg-zinc-950/80 px-3 py-1.5 rounded-lg border border-zinc-800/80">
+            <div class="flex items-center gap-1 font-mono text-[11px]">
+              <span class="text-zinc-400 font-medium">Visual:</span>
+              <span id="wDenseVal" class="text-teal-300 font-bold w-7 text-right">85%</span>
+            </div>
+            <input id="fusionBalance" type="range" min="0" max="100" step="5" value="85" class="w-24 accent-teal-500 cursor-pointer h-1.5 bg-zinc-800 rounded-lg appearance-none" oninput="onBalanceSliderChange()">
+            <div class="flex items-center gap-1 font-mono text-[11px]">
+              <span class="text-zinc-400 font-medium">Speech:</span>
+              <span id="wASRVal" class="text-teal-300 font-bold w-7 text-left">15%</span>
+            </div>
+            <button id="autoTuneBtn" onclick="toggleAutoTune()" title="Click to toggle between Auto-Tune and Manual Mode" class="ml-1 px-2 py-0.5 rounded text-[11px] font-medium bg-zinc-800 text-teal-300 border border-zinc-700 hover:bg-zinc-700 transition-all flex items-center gap-1">
+              <span id="autoTuneIcon">✨</span> <span id="autoTuneText">Auto-Tune</span>
+            </button>
           </div>
-          <div class="flex items-center gap-2">
-            <span class="text-slate-400">Speech (BM25):</span>
-            <input id="wASR" type="range" min="0" max="1" step="0.05" value="0.50" class="w-20 accent-emerald-500" oninput="updateWeights()">
-            <span id="wASRVal" class="text-slate-300 font-mono w-7">0.50</span>
-          </div>
-          <div class="flex items-center gap-2">
-            <span class="text-slate-400">Top-K:</span>
-            <select id="topKSelect" class="bg-slate-900 border border-slate-700/60 rounded px-2 py-1 text-slate-200 focus:outline-none">
-              <option value="25">25</option>
-              <option value="50">50</option>
+
+          <div class="flex items-center gap-1.5">
+            <span class="text-zinc-400 text-xs">Top-K:</span>
+            <select id="topKSelect" class="bg-zinc-900 border border-zinc-800 rounded px-2 py-1 text-zinc-200 focus:outline-none text-xs">
               <option value="100" selected>100</option>
+              <option value="200">200</option>
+              <option value="50">50</option>
+              <option value="25">25</option>
             </select>
           </div>
         </div>
@@ -1754,42 +1778,42 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <!-- Results Status Bar & Feedback Controls -->
-    <div class="flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400 px-1 bg-slate-900/60 p-3 rounded-xl border border-slate-800/80">
+    <div class="flex flex-wrap items-center justify-between gap-3 text-xs text-zinc-400 px-3 py-2 bg-zinc-900/60 rounded-xl border border-zinc-800/80">
       <div class="flex items-center gap-3">
-        <div id="statusText"></div>
-        <div id="timingBadge" class="hidden font-mono bg-slate-900 px-2.5 py-1 rounded border border-slate-800 text-emerald-400"></div>
+        <div id="statusText" class="font-medium text-xs"></div>
+        <div id="timingBadge" class="hidden font-mono bg-zinc-950 px-2 py-0.5 rounded border border-zinc-800 text-teal-400 text-[11px]"></div>
       </div>
       <div class="flex items-center gap-2">
-        <button id="saveQueryResultBtn" onclick="saveActiveQueryResult()" class="text-xs font-bold px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 shadow-md shadow-emerald-500/20 transition flex items-center gap-1.5" title="Lưu kết quả của câu query hiện tại vào danh sách gói bài thi">
+        <button id="saveQueryResultBtn" onclick="saveActiveQueryResult()" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-500 text-zinc-950 shadow-sm transition flex items-center gap-1.5 active:scale-95" title="Lưu kết quả của câu query hiện tại vào danh sách gói bài thi">
           <span>💾</span>
           <span id="saveQueryResultLabel">Save KIS (Top 100)</span>
         </button>
-        <button id="rerankBtn" onclick="executeRerank()" class="hidden text-xs font-bold px-3.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-md shadow-emerald-500/20 transition flex items-center gap-1.5 animate-pulse">
+        <button id="rerankBtn" onclick="executeRerank()" class="hidden text-xs font-semibold px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white shadow-sm transition flex items-center gap-1.5 active:scale-95">
           🎯 Re-rank (0 marked)
         </button>
-        <button id="clearMarksBtn" onclick="clearMarks()" class="hidden text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-rose-300 border border-slate-700/60 transition">
+        <button id="clearMarksBtn" onclick="clearMarks()" class="hidden text-xs font-medium px-2.5 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-rose-300 border border-zinc-700/60 transition">
           ✕ Clear Marks
         </button>
       </div>
     </div>
 
     <!-- Video Filter & Display Toolbar -->
-    <div id="videoFilterBar" class="glass rounded-xl p-2.5 px-3.5 shadow-md flex flex-wrap items-center justify-between gap-3 border border-slate-800 text-xs">
+    <div id="videoFilterBar" class="glass-subtle rounded-xl p-2 px-3.5 shadow-sm flex flex-wrap items-center justify-between gap-3 border border-zinc-800/70 text-xs">
       <div class="flex items-center gap-2 flex-wrap">
-        <span class="text-slate-400 font-semibold flex items-center gap-1">
-          <span>🎬</span> Filter Video:
+        <span class="text-zinc-400 font-medium flex items-center gap-1">
+          🎬 Filter Video:
         </span>
-        <select id="videoFilterSelect" onchange="onVideoFilterSelectChanged(this.value)" class="bg-slate-900 border border-slate-700 text-emerald-300 font-mono text-xs rounded-lg px-2.5 py-1 focus:outline-none focus:border-emerald-400">
+        <select id="videoFilterSelect" onchange="onVideoFilterSelectChanged(this.value)" class="bg-zinc-900 border border-zinc-800 text-teal-300 font-mono text-xs rounded-lg px-2.5 py-1 focus:outline-none focus:border-zinc-600">
           <option value="">All Videos (No filter)</option>
         </select>
-        <input id="videoFilterInput" type="text" placeholder="Search Video ID..." oninput="onVideoFilterInputChanged(this.value)" class="w-40 bg-slate-950 text-slate-200 placeholder-slate-600 rounded-lg px-2.5 py-1 border border-slate-800 focus:outline-none focus:border-emerald-500 font-mono text-xs" />
-        <button id="clearVideoFilterBtn" onclick="clearVideoFilter()" class="hidden px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] transition">
-          ✕ Clear Filter
+        <input id="videoFilterInput" type="text" placeholder="Search Video ID..." oninput="onVideoFilterInputChanged(this.value)" class="w-36 bg-zinc-950 text-zinc-200 placeholder-zinc-600 rounded-lg px-2.5 py-1 border border-zinc-800 focus:outline-none focus:border-zinc-600 font-mono text-xs" />
+        <button id="clearVideoFilterBtn" onclick="clearVideoFilter()" class="hidden px-2 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded text-[11px] transition">
+          ✕ Clear
         </button>
       </div>
 
       <div class="flex items-center gap-2">
-        <span id="filteredCountBadge" class="text-[11px] text-slate-400 font-mono">Showing 0 / 0 keyframes</span>
+        <span id="filteredCountBadge" class="text-[11px] text-zinc-500 font-mono">Showing 0 / 0 keyframes</span>
       </div>
     </div>
 
@@ -1800,158 +1824,158 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
   <!-- Video Inspection Modal (Non-blocking: Queries Sidebar stays visible on the left) -->
-  <div id="detailModal" onclick="if(event.target === this) closeModal()" class="fixed inset-0 z-40 bg-black/40 hidden flex items-center justify-center md:pl-80 lg:pl-96 p-2 md:p-6 overflow-y-auto">
-    <div class="glass max-w-4xl w-full rounded-2xl overflow-hidden shadow-2xl border border-slate-700 flex flex-col max-h-[92vh]">
+  <div id="detailModal" onclick="if(event.target === this) closeModal()" class="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm hidden flex items-center justify-center md:pl-80 lg:pl-96 p-2 md:p-6 overflow-y-auto">
+    <div class="glass max-w-4xl w-full rounded-2xl overflow-hidden shadow-2xl border border-zinc-700/70 flex flex-col max-h-[92vh]">
       
       <!-- Modal Header -->
-      <div class="p-4 border-b border-slate-800 flex items-center justify-between bg-slate-900/40">
-        <div class="flex items-center gap-3">
-          <div class="w-3 h-3 rounded-full bg-emerald-400 animate-pulse"></div>
-          <h3 id="modalTitle" class="font-bold text-sm text-slate-200 font-mono">Video Player</h3>
+      <div class="p-3.5 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/60">
+        <div class="flex items-center gap-2.5">
+          <div class="w-2.5 h-2.5 rounded-full bg-teal-400"></div>
+          <h3 id="modalTitle" class="font-bold text-xs sm:text-sm text-zinc-200 font-mono">Video Player</h3>
         </div>
-        <button onclick="closeModal()" class="text-slate-400 hover:text-white text-xl p-1">✕</button>
+        <button onclick="closeModal()" class="text-zinc-400 hover:text-white text-lg p-1">✕</button>
       </div>
 
       <!-- Modal Body -->
       <div class="p-3.5 flex flex-col gap-2.5 overflow-y-auto">
         
         <!-- Video Player Element (Compact 36vh Fit - Keeps TRAKE and Controls Fully Visible) -->
-        <div class="w-full max-w-[680px] mx-auto flex items-center justify-center bg-slate-950/90 rounded-xl border border-slate-800/80 p-1">
+        <div class="w-full max-w-[680px] mx-auto flex items-center justify-center bg-zinc-950 rounded-xl border border-zinc-800/80 p-1">
           <video id="mainVideoPlayer" controls autoplay playsinline class="w-full max-h-[36vh] object-contain rounded-lg block shadow-lg"></video>
         </div>
 
         <!-- Video Player Fast Seeking & Controls -->
-        <div class="flex flex-wrap items-center justify-between gap-2 bg-slate-900/80 p-2 rounded-xl border border-slate-800 text-xs">
-          <div class="flex items-center gap-2">
-            <button onclick="seekRel(-5)" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 rounded text-slate-200 font-medium">⏪ -5s</button>
-            <button onclick="seekRel(-1)" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 rounded text-slate-200 font-medium">⏮ -1s</button>
-            <button onclick="seekRel(1)" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 rounded text-slate-200 font-medium">+1s ⏭</button>
-            <button onclick="seekRel(5)" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 rounded text-slate-200 font-medium">+5s ⏩</button>
-            <button onclick="jumpToCandidate()" class="px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 font-semibold rounded border border-emerald-500/40">
-              🎯 Jump to Candidate Frame
+        <div class="flex flex-wrap items-center justify-between gap-2 bg-zinc-900/80 p-2 rounded-xl border border-zinc-800 text-xs">
+          <div class="flex items-center gap-1.5">
+            <button onclick="seekRel(-5)" class="px-2 py-1 bg-zinc-800 hover:bg-zinc-700 rounded text-zinc-200 font-medium">⏪ -5s</button>
+            <button onclick="seekRel(-1)" class="px-2 py-1 bg-zinc-800 hover:bg-zinc-700 rounded text-zinc-200 font-medium">⏮ -1s</button>
+            <button onclick="seekRel(1)" class="px-2 py-1 bg-zinc-800 hover:bg-zinc-700 rounded text-zinc-200 font-medium">+1s ⏭</button>
+            <button onclick="seekRel(5)" class="px-2 py-1 bg-zinc-800 hover:bg-zinc-700 rounded text-zinc-200 font-medium">+5s ⏩</button>
+            <button onclick="jumpToCandidate()" class="px-2.5 py-1 bg-teal-500/15 hover:bg-teal-500/25 text-teal-300 font-medium rounded border border-teal-500/30">
+              🎯 Jump Frame
             </button>
           </div>
 
           <!-- Clip Range Marking Controls -->
-          <div class="flex items-center gap-1.5 bg-slate-950/80 px-2.5 py-1.5 rounded-lg border border-slate-700/60">
-            <button onclick="setModalClipStart()" class="px-2 py-1 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 font-semibold rounded text-[11px] border border-emerald-500/40 transition flex items-center gap-1" title="Đánh dấu mốc Start từ thời điểm phát video hiện tại">
-              ⏱️ Set Start
+          <div class="flex items-center gap-1.5 bg-zinc-950/80 px-2 py-1 rounded-lg border border-zinc-800">
+            <button onclick="setModalClipStart()" class="px-2 py-0.5 bg-teal-500/15 hover:bg-teal-500/25 text-teal-300 font-medium rounded text-[11px] border border-teal-500/30 transition flex items-center gap-1" title="Đánh dấu mốc Start từ thời điểm phát video hiện tại">
+              ⏱️ Start
             </button>
-            <span id="modalClipStartBadge" class="font-mono text-emerald-400 text-xs font-bold px-1">--:--</span>
-            <span class="text-slate-500 text-xs">──</span>
-            <span id="modalClipEndBadge" class="font-mono text-amber-300 text-xs font-bold px-1">--:--</span>
-            <button onclick="setModalClipEnd()" class="px-2 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 font-semibold rounded text-[11px] border border-amber-500/40 transition flex items-center gap-1" title="Đánh dấu mốc End từ thời điểm phát video hiện tại">
-              ⏱️ Set End
+            <span id="modalClipStartBadge" class="font-mono text-teal-300 text-xs font-semibold px-1">--:--</span>
+            <span class="text-zinc-600 text-xs">──</span>
+            <span id="modalClipEndBadge" class="font-mono text-amber-300 text-xs font-semibold px-1">--:--</span>
+            <button onclick="setModalClipEnd()" class="px-2 py-0.5 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 font-medium rounded text-[11px] border border-amber-500/30 transition flex items-center gap-1" title="Đánh dấu mốc End từ thời điểm phát video hiện tại">
+              ⏱️ End
             </button>
           </div>
 
-          <div class="flex items-center gap-3">
-            <span class="text-slate-400">Speed:</span>
-            <button onclick="setSpeed(1.0)" class="speed-btn px-2 py-1 bg-slate-800 rounded text-slate-300" data-spd="1.0">1.0x</button>
-            <button onclick="setSpeed(1.5)" class="speed-btn px-2 py-1 bg-slate-800 rounded text-slate-300" data-spd="1.5">1.5x</button>
-            <button onclick="setSpeed(2.0)" class="speed-btn px-2 py-1 bg-slate-800 rounded text-slate-300" data-spd="2.0">2.0x</button>
+          <div class="flex items-center gap-2">
+            <span class="text-zinc-500 text-[11px]">Speed:</span>
+            <button onclick="setSpeed(1.0)" class="speed-btn px-1.5 py-0.5 bg-zinc-800 rounded text-zinc-300 text-xs" data-spd="1.0">1.0x</button>
+            <button onclick="setSpeed(1.5)" class="speed-btn px-1.5 py-0.5 bg-zinc-800 rounded text-zinc-300 text-xs" data-spd="1.5">1.5x</button>
+            <button onclick="setSpeed(2.0)" class="speed-btn px-1.5 py-0.5 bg-zinc-800 rounded text-zinc-300 text-xs" data-spd="2.0">2.0x</button>
           </div>
         </div>
 
         <!-- Metadata & Live Frame Tracker -->
         <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
-          <div class="bg-slate-900 p-2 rounded-lg border border-slate-800">
-            <span class="text-slate-500 font-semibold block mb-0.5 text-[10px]">VIDEO ID</span>
-            <span id="modalVideo" class="text-emerald-400 font-mono text-xs font-bold truncate block"></span>
+          <div class="bg-zinc-900/80 p-2 rounded-lg border border-zinc-800">
+            <span class="text-zinc-500 font-medium block mb-0.5 text-[10px]">VIDEO ID</span>
+            <span id="modalVideo" class="text-teal-300 font-mono text-xs font-semibold truncate block"></span>
           </div>
-          <div class="bg-slate-900 p-2 rounded-lg border border-slate-800">
-            <span class="text-slate-500 font-semibold block mb-0.5 text-[10px]">CANDIDATE FRAME</span>
-            <span id="modalCandidateFrame" class="text-slate-200 font-mono text-xs truncate block"></span>
+          <div class="bg-zinc-900/80 p-2 rounded-lg border border-zinc-800">
+            <span class="text-zinc-500 font-medium block mb-0.5 text-[10px]">CANDIDATE FRAME</span>
+            <span id="modalCandidateFrame" class="text-zinc-300 font-mono text-xs truncate block"></span>
           </div>
-          <div class="bg-slate-900 p-2 rounded-lg border border-slate-800">
-            <span class="text-slate-500 font-semibold block mb-0.5 text-[10px]">PLAYING FRAME</span>
-            <span id="modalCurrentFrame" class="text-amber-300 font-mono text-xs font-bold block">0 (00:00)</span>
+          <div class="bg-zinc-900/80 p-2 rounded-lg border border-zinc-800">
+            <span class="text-zinc-500 font-medium block mb-0.5 text-[10px]">PLAYING FRAME</span>
+            <span id="modalCurrentFrame" class="text-amber-300 font-mono text-xs font-semibold block">0 (00:00)</span>
           </div>
-          <div class="bg-slate-900 p-2 rounded-lg border border-slate-800">
-            <span class="text-slate-500 font-semibold block mb-0.5 text-[10px]">MATCH STATUS</span>
-            <span id="modalPinnedStatus" class="text-slate-400 font-mono text-xs block">Not Pinned</span>
+          <div class="bg-zinc-900/80 p-2 rounded-lg border border-zinc-800">
+            <span class="text-zinc-500 font-medium block mb-0.5 text-[10px]">MATCH STATUS</span>
+            <span id="modalPinnedStatus" class="text-zinc-400 font-mono text-xs block">Not Pinned</span>
           </div>
         </div>
 
         <!-- Refined Speech Dialogue -->
-        <div class="bg-slate-900 p-2.5 rounded-lg border border-slate-800 flex flex-col gap-1">
-          <span class="text-slate-400 text-xs font-semibold">🎙️ REFINED SPEECH DIALOGUE (BM25 MATCH)</span>
-          <p id="modalASR" class="text-xs text-slate-200 italic leading-relaxed"></p>
+        <div class="bg-zinc-900/80 p-2.5 rounded-lg border border-zinc-800 flex flex-col gap-1">
+          <span class="text-zinc-500 text-[11px] font-semibold">🎙️ SPEECH DIALOGUE (BM25 MATCH)</span>
+          <p id="modalASR" class="text-xs text-zinc-300 italic leading-relaxed"></p>
         </div>
 
         <!-- Mode-Specific UI in Modal -->
         <!-- 1. Q&A Answer Section (Active in Q&A Mode) -->
-        <div id="modalQABox" class="bg-slate-900 p-2.5 rounded-xl border border-amber-500/30 flex flex-col gap-2">
+        <div id="modalQABox" class="bg-zinc-900/80 p-2.5 rounded-xl border border-amber-500/20 flex flex-col gap-2">
           <div class="flex items-center justify-between text-xs">
-            <span class="text-amber-400 font-bold flex items-center gap-1.5">
+            <span class="text-amber-300 font-semibold flex items-center gap-1.5">
               💬 Q&A Answer (Câu trả lời cho Video này):
             </span>
-            <span id="modalQACharCount" class="text-[10px] text-slate-500 font-mono">0/100 chars</span>
+            <span id="modalQACharCount" class="text-[10px] text-zinc-500 font-mono">0/100 chars</span>
           </div>
           <div class="flex items-center gap-2 text-xs">
-            <input id="modalQAInput" type="text" maxlength="100" placeholder="Nhập câu trả lời (VD: 5, Năm người, Màu đỏ, rất đẹp)..." class="flex-1 bg-slate-950 text-amber-200 placeholder-slate-600 rounded-lg px-3 py-2 border border-slate-700 focus:outline-none focus:border-amber-400 font-medium" oninput="onModalQAInputChanged()" />
-            <button onclick="saveModalQAAnswer()" class="px-3.5 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg transition whitespace-nowrap">
+            <input id="modalQAInput" type="text" maxlength="100" placeholder="Nhập câu trả lời (VD: 5, Năm người, Màu đỏ)..." class="flex-1 bg-zinc-950 text-amber-200 placeholder-zinc-600 rounded-lg px-3 py-1.5 border border-zinc-800 focus:outline-none focus:border-amber-500/50 font-medium" oninput="onModalQAInputChanged()" />
+            <button onclick="saveModalQAAnswer()" class="px-3.5 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/30 font-semibold rounded-lg transition whitespace-nowrap active:scale-95">
               💾 Lưu Answer
             </button>
           </div>
         </div>
 
         <!-- 2. TRAKE Event Sequence Section (Active in TRAKE Mode) -->
-        <div id="modalTrakeBox" class="bg-slate-900 p-2.5 rounded-xl border border-indigo-500/40 flex flex-col gap-2">
+        <div id="modalTrakeBox" class="bg-zinc-900/80 p-2.5 rounded-xl border border-indigo-500/20 flex flex-col gap-2">
           <div class="flex items-center justify-between text-xs">
             <div class="flex items-center gap-1.5">
-              <span class="text-indigo-400 font-bold flex items-center gap-1">⏱️ TRAKE Event Sequence:</span>
-              <span id="modalTrakeCountBadge" class="font-mono text-[10px] px-2 py-0.5 rounded bg-slate-950 text-indigo-300 border border-indigo-500/30">0 events</span>
+              <span class="text-indigo-300 font-semibold flex items-center gap-1">⏱️ TRAKE Event Sequence:</span>
+              <span id="modalTrakeCountBadge" class="font-mono text-[10px] px-2 py-0.5 rounded bg-zinc-950 text-indigo-300 border border-zinc-800">0 events</span>
             </div>
-            <div class="flex items-center gap-2">
-              <button onclick="addCurrentFrameToTrake()" class="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded text-[11px] transition flex items-center gap-1 shadow-sm">
-                ➕ Mark Current Frame
+            <div class="flex items-center gap-1.5">
+              <button onclick="addCurrentFrameToTrake()" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded text-[11px] transition flex items-center gap-1 shadow-sm active:scale-95">
+                ➕ Mark Frame
               </button>
-              <button onclick="saveModalTrakeEvents(false)" class="px-2.5 py-1 bg-indigo-500 hover:bg-indigo-400 text-slate-950 font-bold rounded text-[11px] transition flex items-center gap-1 shadow-sm" title="Lưu chuỗi sự kiện TRAKE cho video này">
+              <button onclick="saveModalTrakeEvents(false)" class="px-2 py-1 bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 border border-indigo-500/30 font-semibold rounded text-[11px] transition flex items-center gap-1 active:scale-95" title="Lưu chuỗi sự kiện TRAKE cho video này">
                 💾 Save TRAKE
               </button>
-              <button onclick="clearAllTrakeEvents()" class="px-2 py-1 bg-slate-800 hover:bg-rose-900/50 text-rose-400 rounded text-[11px] transition">
-                🗑️ Clear All
+              <button onclick="clearAllTrakeEvents()" class="px-2 py-1 bg-zinc-800 hover:bg-rose-950/40 text-rose-300 border border-zinc-700/60 rounded text-[11px] transition">
+                🗑️ Clear
               </button>
             </div>
           </div>
           <div id="modalTrakeEventsList" class="flex flex-wrap gap-2 text-xs min-h-[32px] items-center">
-            <span class="text-slate-500 text-[11px] italic">Chưa có mốc sự kiện nào. Hãy tua video và bấm "+ Mark Current Frame".</span>
+            <span class="text-zinc-500 text-[11px] italic">Chưa có mốc sự kiện nào. Hãy tua video và bấm "+ Mark Frame".</span>
           </div>
         </div>
       </div>
 
       <!-- Modal Footer -->
-      <div class="p-4 border-t border-slate-800 bg-slate-900/60 flex flex-wrap items-center justify-between gap-3">
-        <div class="flex flex-wrap items-center gap-2">
+      <div class="p-3.5 border-t border-zinc-800 bg-zinc-900/60 flex flex-wrap items-center justify-between gap-2">
+        <div class="flex flex-wrap items-center gap-1.5">
           <!-- Standout Pin Current Frame Button -->
-          <button onclick="pinModalPlayingFrame()" class="px-3.5 py-2 bg-gradient-to-r from-amber-500 to-emerald-500 hover:from-amber-400 hover:to-emerald-400 text-slate-950 font-extrabold text-xs rounded-lg shadow-lg shadow-emerald-500/20 transition flex items-center gap-1.5" title="Chọn chính xác khung hình đang dừng/phát làm kết quả chính">
-            🎯 Pin Current Frame as Match
+          <button onclick="pinModalPlayingFrame()" class="px-3 py-1.5 bg-amber-400 hover:bg-amber-300 text-zinc-950 font-bold text-xs rounded-lg shadow-sm transition flex items-center gap-1.5 active:scale-95" title="Chọn chính xác khung hình đang dừng/phát làm kết quả chính">
+            🎯 Pin Current Frame
           </button>
           <!-- Neighbor Flood Button -->
-          <button onclick="floodNeighborsModal()" class="px-3 py-2 bg-gradient-to-r from-sky-600 to-teal-600 hover:from-sky-500 hover:to-teal-500 text-white font-bold text-xs rounded-lg shadow-md shadow-sky-500/20 transition flex items-center gap-1.5" title="Tự động điền 100 khung hình liền kề xung quanh frame này để tối đa hóa điểm R@k">
-            ⚡ Flood Top 100 Neighbors
+          <button onclick="floodNeighborsModal()" class="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 font-medium text-xs rounded-lg transition flex items-center gap-1.5 active:scale-95" title="Tự động điền 100 khung hình liền kề xung quanh frame này để tối đa hóa điểm R@k">
+            ⚡ Flood 100 Neighbors
           </button>
-          <button id="modalSaveTrakeFooterBtn" onclick="saveModalTrakeEvents(true)" class="px-3.5 py-2 bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white font-bold text-xs rounded-lg shadow-md shadow-indigo-500/30 transition flex items-center gap-1.5 hidden">
+          <button id="modalSaveTrakeFooterBtn" onclick="saveModalTrakeEvents(true)" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-xs rounded-lg shadow-sm transition flex items-center gap-1.5 hidden active:scale-95">
             💾 Save TRAKE & Close
           </button>
-          <button id="modalSaveQAFooterBtn" onclick="saveModalQAAnswer(true)" class="px-3.5 py-2 bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-bold text-xs rounded-lg shadow-md shadow-amber-500/20 transition flex items-center gap-1.5 hidden">
+          <button id="modalSaveQAFooterBtn" onclick="saveModalQAAnswer(true)" class="px-3 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/30 font-semibold text-xs rounded-lg transition flex items-center gap-1.5 hidden active:scale-95">
             💾 Save Q&A & Close
           </button>
-          <button id="modalCopyBtn" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs rounded-lg transition">
+          <button id="modalCopyBtn" class="px-2.5 py-1.5 bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 font-medium text-xs rounded-lg border border-zinc-700/60 transition">
             📋 Copy Candidate
           </button>
-          <button id="modalCopyCurrentBtn" onclick="copyCurrentPlayingFrame(this)" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/30 font-semibold text-xs rounded-lg transition">
-            📸 Copy Paused Frame
+          <button id="modalCopyCurrentBtn" onclick="copyCurrentPlayingFrame(this)" class="px-2.5 py-1.5 bg-zinc-800/80 hover:bg-zinc-700 text-amber-300/90 border border-zinc-700/60 font-medium text-xs rounded-lg transition">
+            📸 Copy Paused
           </button>
-          <button onclick="askVlmFromModalClip()" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-emerald-500/30 font-semibold text-xs rounded-lg transition flex items-center gap-1.5" title="Hỏi VLM về đoạn clip ngắn đã đánh dấu [Start, End]">
-            🤖 Ask VLM About Clip
+          <button onclick="askVlmFromModalClip()" class="px-2.5 py-1.5 bg-zinc-800/80 hover:bg-zinc-700 text-teal-300 border border-teal-500/30 font-medium text-xs rounded-lg transition flex items-center gap-1.5" title="Hỏi VLM về đoạn clip ngắn đã đánh dấu [Start, End]">
+            🤖 Ask VLM
           </button>
-          <button onclick="markCurrentModalFrameAndRerank()" class="px-3 py-2 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 font-bold text-xs rounded-lg transition flex items-center gap-1.5">
+          <button onclick="markCurrentModalFrameAndRerank()" class="px-2.5 py-1.5 bg-teal-500/15 hover:bg-teal-500/25 text-teal-300 border border-teal-500/30 font-semibold text-xs rounded-lg transition flex items-center gap-1.5 active:scale-95">
             🎯 Mark & Re-rank
           </button>
         </div>
-        <button onclick="closeModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg transition">
+        <button onclick="closeModal()" class="px-3.5 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs rounded-lg transition">
           Close
         </button>
       </div>
@@ -1959,115 +1983,115 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <!-- Floating AI Assistant Open Button (when drawer is minimized or closed) -->
-  <div id="aiChatFab" class="fixed bottom-6 right-6 z-50">
-    <button onclick="toggleChatbot()" class="glass px-4 py-3 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold text-xs shadow-2xl shadow-emerald-500/40 border border-emerald-300/50 transition-all transform hover:scale-105 active:scale-95 flex items-center gap-2.5">
-      <span class="text-xl">🤖</span>
+  <div id="aiChatFab" class="fixed bottom-6 right-6 z-40">
+    <button onclick="toggleChatbot()" class="glass px-3.5 py-2.5 rounded-2xl bg-zinc-900/90 hover:bg-zinc-800 text-zinc-200 font-medium text-xs shadow-xl border border-zinc-700/60 transition-all transform hover:scale-105 active:scale-95 flex items-center gap-2.5">
+      <span class="text-lg">🤖</span>
       <div class="flex flex-col text-left leading-tight">
-        <span class="font-extrabold text-[12px] text-slate-950">VLM Assistant</span>
-        <span id="fabModelText" class="text-[9px] text-slate-900/80 font-mono font-semibold">antigravity/gemini-3.6-flash-medium</span>
+        <span class="font-semibold text-xs text-zinc-100">VLM Assistant</span>
+        <span id="fabModelText" class="text-[9px] text-zinc-500 font-mono">antigravity/gemini-3.6-flash-medium</span>
       </div>
-      <span id="aiFabBadge" class="hidden px-1.5 py-0.5 bg-slate-950 text-emerald-400 text-[10px] font-mono rounded-full border border-emerald-500/30">0</span>
+      <span id="aiFabBadge" class="hidden px-1.5 py-0.2 bg-teal-500/20 text-teal-300 text-[10px] font-mono rounded-full border border-teal-500/30 font-bold">0</span>
     </button>
   </div>
 
   <!-- AI Chatbot Drawer / Window -->
-  <div id="aiChatDrawer" class="fixed bottom-6 right-6 z-50 w-[460px] max-w-[calc(100vw-2rem)] h-[640px] max-h-[calc(100vh-5rem)] glass rounded-2xl shadow-2xl border border-emerald-500/30 flex flex-col overflow-hidden transition-all duration-300 hidden">
+  <div id="aiChatDrawer" class="fixed bottom-6 right-6 z-50 w-[450px] max-w-[calc(100vw-2rem)] h-[620px] max-h-[calc(100vh-5rem)] glass rounded-2xl shadow-2xl border border-zinc-700/70 flex flex-col overflow-hidden transition-all duration-300 hidden">
     
     <!-- Chatbot Header -->
-    <div class="px-4 py-3 bg-slate-900/90 border-b border-slate-800 flex items-center justify-between">
-      <div class="flex items-center gap-2.5 min-w-0">
-        <div class="w-7 h-7 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-bold text-sm border border-emerald-500/30">
+    <div class="px-4 py-2.5 bg-zinc-900/95 border-b border-zinc-800 flex items-center justify-between">
+      <div class="flex items-center gap-2 min-w-0">
+        <div class="w-6 h-6 rounded-lg bg-teal-500/15 text-teal-300 flex items-center justify-center font-bold text-xs border border-teal-500/30">
           🤖
         </div>
         <div class="min-w-0">
           <div class="flex items-center gap-1.5">
-            <h3 class="font-bold text-xs text-slate-200 truncate">VLM Video Assistant</h3>
-            <span id="drawerModelPill" class="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono">antigravity/gemini-3.6-flash-medium</span>
+            <h3 class="font-semibold text-xs text-zinc-200 truncate">VLM Video Assistant</h3>
+            <span id="drawerModelPill" class="text-[9px] px-1.5 py-0.2 rounded bg-zinc-950 text-zinc-400 border border-zinc-800 font-mono">antigravity/gemini-3.6-flash-medium</span>
           </div>
-          <p id="aiChatActiveVideoLabel" class="text-[10px] text-slate-400 truncate font-mono">No video selected</p>
+          <p id="aiChatActiveVideoLabel" class="text-[10px] text-zinc-500 truncate font-mono">No video selected</p>
         </div>
       </div>
 
       <div class="flex items-center gap-1">
-        <button onclick="toggleChatSettings()" class="p-1.5 text-slate-400 hover:text-emerald-400 hover:bg-slate-800 rounded-lg transition" title="Chatbot Settings (API Key & Provider)">
+        <button onclick="toggleChatSettings()" class="p-1 text-zinc-400 hover:text-teal-300 hover:bg-zinc-800 rounded-lg transition" title="Chatbot Settings (API Key & Provider)">
           ⚙️
         </button>
-        <button onclick="clearChatHistory()" class="p-1.5 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded-lg transition" title="Clear Conversation">
+        <button onclick="clearChatHistory()" class="p-1 text-zinc-400 hover:text-rose-400 hover:bg-zinc-800 rounded-lg transition" title="Clear Conversation">
           🗑️
         </button>
-        <button onclick="toggleChatbot()" class="p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition" title="Close AI Assistant">
+        <button onclick="toggleChatbot()" class="p-1 text-zinc-400 hover:text-white hover:bg-zinc-800 rounded-lg transition" title="Close AI Assistant">
           ✕
         </button>
       </div>
     </div>
 
     <!-- Active Video Context Bar / Video Selector -->
-    <div class="px-4 py-2 bg-slate-950/60 border-b border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400">
+    <div class="px-4 py-1.5 bg-zinc-950/70 border-b border-zinc-800 flex items-center justify-between text-[11px] text-zinc-400">
       <div class="flex items-center gap-1.5 min-w-0">
-        <span class="text-slate-500 font-semibold">Video:</span>
-        <select id="aiVideoSelect" onchange="onActiveVideoChange(this.value)" class="bg-slate-900 text-emerald-300 font-mono text-[11px] rounded px-1.5 py-0.5 border border-slate-700/60 focus:outline-none max-w-[170px] truncate">
+        <span class="text-zinc-500 font-medium">Video:</span>
+        <select id="aiVideoSelect" onchange="onActiveVideoChange(this.value)" class="bg-zinc-900 text-teal-300 font-mono text-[11px] rounded px-1.5 py-0.5 border border-zinc-800 focus:outline-none max-w-[170px] truncate">
           <option value="">(Chưa chọn video)</option>
         </select>
       </div>
-      <div id="aiContextStats" class="font-mono text-[10px] text-emerald-400/80 truncate">
+      <div id="aiContextStats" class="font-mono text-[10px] text-zinc-500 truncate">
         0 ASR • 0 OCR
       </div>
     </div>
 
     <!-- VLM Clip Interval & Range Marking Bar -->
-    <div class="px-4 py-2.5 bg-slate-900/90 border-b border-slate-800 flex flex-col gap-1.5">
+    <div class="px-4 py-2 bg-zinc-900/90 border-b border-zinc-800 flex flex-col gap-1.5">
       <div class="flex items-center justify-between text-[11px]">
-        <span class="text-slate-300 font-semibold flex items-center gap-1">
-          🎞️ <span class="text-emerald-400">VLM Clip Range:</span>
+        <span class="text-zinc-300 font-medium flex items-center gap-1">
+          🎞️ <span class="text-teal-400">Clip Range:</span>
         </span>
-        <span id="aiClipDurationBadge" class="font-mono text-[10px] px-2 py-0.5 rounded bg-slate-950 text-amber-400 border border-slate-800 font-medium">
+        <span id="aiClipDurationBadge" class="font-mono text-[10px] px-2 py-0.2 rounded bg-zinc-950 text-zinc-400 border border-zinc-800 font-medium">
           Chưa đánh dấu
         </span>
       </div>
-      <div class="flex items-center gap-2 text-xs">
+      <div class="flex items-center gap-1.5 text-xs">
         <div class="flex items-center gap-1 flex-1 min-w-0">
-          <span class="text-slate-500 text-[10px] font-semibold">Start:</span>
-          <input id="aiClipStartInput" type="number" step="0.1" min="0" placeholder="0.0" class="w-full bg-slate-950 text-emerald-300 font-mono text-xs rounded px-2 py-1 border border-slate-700 focus:outline-none focus:border-emerald-500" oninput="onClipRangeChanged()" />
-          <button onclick="setClipStartFromPlayer()" class="px-1.5 py-1 bg-slate-800 hover:bg-slate-700 text-emerald-400 rounded text-[10px] border border-slate-700" title="Lấy mốc thời gian hiện tại từ Video Player">⏱️</button>
+          <span class="text-zinc-500 text-[10px]">Start:</span>
+          <input id="aiClipStartInput" type="number" step="0.1" min="0" placeholder="0.0" class="w-full bg-zinc-950 text-teal-300 font-mono text-xs rounded px-2 py-1 border border-zinc-800 focus:outline-none focus:border-teal-500/50" oninput="onClipRangeChanged()" />
+          <button onclick="setClipStartFromPlayer()" class="px-1.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-teal-300 rounded text-[10px] border border-zinc-700" title="Lấy mốc thời gian hiện tại từ Video Player">⏱️</button>
         </div>
-        <span class="text-slate-600 font-bold">→</span>
+        <span class="text-zinc-600 font-bold">→</span>
         <div class="flex items-center gap-1 flex-1 min-w-0">
-          <span class="text-slate-500 text-[10px] font-semibold">End:</span>
-          <input id="aiClipEndInput" type="number" step="0.1" min="0" placeholder="0.0" class="w-full bg-slate-950 text-amber-300 font-mono text-xs rounded px-2 py-1 border border-slate-700 focus:outline-none focus:border-amber-500" oninput="onClipRangeChanged()" />
-          <button onclick="setClipEndFromPlayer()" class="px-1.5 py-1 bg-slate-800 hover:bg-slate-700 text-amber-300 rounded text-[10px] border border-slate-700" title="Lấy mốc thời gian hiện tại từ Video Player">⏱️</button>
+          <span class="text-zinc-500 text-[10px]">End:</span>
+          <input id="aiClipEndInput" type="number" step="0.1" min="0" placeholder="0.0" class="w-full bg-zinc-950 text-amber-300 font-mono text-xs rounded px-2 py-1 border border-zinc-800 focus:outline-none focus:border-amber-500/50" oninput="onClipRangeChanged()" />
+          <button onclick="setClipEndFromPlayer()" class="px-1.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-amber-300 rounded text-[10px] border border-zinc-700" title="Lấy mốc thời gian hiện tại từ Video Player">⏱️</button>
         </div>
-        <button onclick="autoFillClipWindow()" class="px-2 py-1 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 rounded text-[10px] whitespace-nowrap font-medium transition" title="Tự động lấy khoảng ±5s quanh Keyframe">
+        <button onclick="autoFillClipWindow()" class="px-2 py-1 bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 border border-teal-500/30 rounded text-[10px] whitespace-nowrap font-medium transition" title="Tự động lấy khoảng ±5s quanh Keyframe">
           ⚡ Auto ±5s
         </button>
       </div>
     </div>
 
     <!-- Q&A Final Answer Bar inside Chatbot -->
-    <div id="aiQAAnswerBox" class="px-4 py-2.5 bg-slate-900/95 border-b border-slate-800 flex flex-col gap-1.5">
+    <div id="aiQAAnswerBox" class="px-4 py-2 bg-zinc-900/95 border-b border-zinc-800 flex flex-col gap-1">
       <div class="flex items-center justify-between text-[11px]">
-        <span class="text-amber-400 font-bold flex items-center gap-1">
-          ✍️ <span id="aiQAAnswerLabel">Q&A Answer Box:</span>
+        <span class="text-amber-300 font-medium flex items-center gap-1">
+          ✍️ <span id="aiQAAnswerLabel">Q&A Answer:</span>
         </span>
-        <span id="aiQACharCount" class="text-[10px] text-slate-500 font-mono">0/100 chars</span>
+        <span id="aiQACharCount" class="text-[10px] text-zinc-500 font-mono">0/100 chars</span>
       </div>
-      <div class="flex items-center gap-2 text-xs">
-        <input id="aiQAAnswerInput" type="text" maxlength="100" placeholder="Nhập câu trả lời cho video này (VD: 5, Năm người, Màu đỏ)..." class="flex-1 bg-slate-950 text-amber-200 placeholder-slate-600 rounded-lg px-2.5 py-1.5 border border-amber-500/30 focus:outline-none focus:border-amber-400 font-medium text-xs" oninput="onDrawerQAInputChanged()" />
-        <button onclick="saveDrawerQAAnswer()" class="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg transition whitespace-nowrap text-xs">
+      <div class="flex items-center gap-1.5 text-xs">
+        <input id="aiQAAnswerInput" type="text" maxlength="100" placeholder="Nhập câu trả lời cho video này..." class="flex-1 bg-zinc-950 text-amber-200 placeholder-zinc-600 rounded-lg px-2.5 py-1 border border-amber-500/30 focus:outline-none focus:border-amber-400 font-medium text-xs" oninput="onDrawerQAInputChanged()" />
+        <button onclick="saveDrawerQAAnswer()" class="px-3 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/30 font-semibold rounded-lg transition whitespace-nowrap text-xs">
           💾 Lưu
         </button>
       </div>
     </div>
 
     <!-- Settings Overlay (Hidden by default) -->
-    <div id="aiSettingsOverlay" class="p-4 bg-slate-900/95 border-b border-slate-800 flex flex-col gap-3 text-xs hidden">
+    <div id="aiSettingsOverlay" class="p-3.5 bg-zinc-900/95 border-b border-zinc-800 flex flex-col gap-2.5 text-xs hidden">
       <div class="flex items-center justify-between">
-        <span class="font-bold text-slate-200">⚙️ AI Model & API Configuration</span>
-        <button onclick="toggleChatSettings()" class="text-slate-400 hover:text-white">✕</button>
+        <span class="font-semibold text-zinc-200">⚙️ AI Model & API Configuration</span>
+        <button onclick="toggleChatSettings()" class="text-zinc-400 hover:text-white">✕</button>
       </div>
       
       <div class="flex flex-col gap-1">
-        <label class="text-[11px] text-slate-400 font-medium">Provider:</label>
-        <select id="aiProviderSelect" onchange="onProviderChange()" class="bg-slate-950 text-slate-200 rounded px-2 py-1.5 border border-slate-700 focus:outline-none">
+        <label class="text-[11px] text-zinc-400 font-medium">Provider:</label>
+        <select id="aiProviderSelect" onchange="onProviderChange()" class="bg-zinc-950 text-zinc-200 rounded px-2 py-1 border border-zinc-800 focus:outline-none">
           <option value="omniroute" selected>OmniRoute (Localhost 20128 - Gemini 3.6 Flash Medium)</option>
           <option value="openrouter">OpenRouter (DeepSeek, Claude, Llama...)</option>
           <option value="openai">OpenAI (GPT-4o, GPT-4o-mini)</option>
@@ -2076,58 +2100,59 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <div id="aiCustomUrlGroup" class="flex flex-col gap-1 hidden">
-        <label class="text-[11px] text-slate-400 font-medium">Custom API URL:</label>
-        <input id="aiCustomUrlInput" type="text" placeholder="http://localhost:20128/v1/chat/completions" class="bg-slate-950 text-slate-200 rounded px-2.5 py-1.5 border border-slate-700 focus:outline-none" />
+        <label class="text-[11px] text-zinc-400 font-medium">Custom API URL:</label>
+        <input id="aiCustomUrlInput" type="text" placeholder="http://localhost:20128/v1/chat/completions" class="bg-zinc-950 text-zinc-200 rounded px-2.5 py-1 border border-zinc-800 focus:outline-none" />
       </div>
 
       <div class="flex flex-col gap-1">
-        <label class="text-[11px] text-slate-400 font-medium">Model Identifier:</label>
-        <input id="aiModelInput" type="text" value="antigravity/gemini-3.6-flash-medium" placeholder="antigravity/gemini-3.6-flash-medium" class="bg-slate-950 text-slate-200 rounded px-2.5 py-1.5 border border-slate-700 focus:outline-none" />
+        <label class="text-[11px] text-zinc-400 font-medium">Model Identifier:</label>
+        <input id="aiModelInput" type="text" value="antigravity/gemini-3.6-flash-medium" placeholder="antigravity/gemini-3.6-flash-medium" class="bg-zinc-950 text-zinc-200 rounded px-2.5 py-1 border border-zinc-800 focus:outline-none" />
       </div>
 
       <div class="flex flex-col gap-1">
-        <label class="text-[11px] text-slate-400 font-medium">API Key (Optional override):</label>
-        <input id="aiApiKeyInput" type="password" value="omniroute" placeholder="omniroute" class="bg-slate-950 text-slate-200 rounded px-2.5 py-1.5 border border-slate-700 focus:outline-none" />
-        <span class="text-[10px] text-slate-500">Mặc định: 'omniroute' (OmniRoute localhost proxy).</span>
+        <label class="text-[11px] text-zinc-400 font-medium">API Key (Optional override):</label>
+        <input id="aiApiKeyInput" type="password" value="omniroute" placeholder="omniroute" class="bg-zinc-950 text-zinc-200 rounded px-2.5 py-1 border border-zinc-800 focus:outline-none" />
+        <span class="text-[10px] text-zinc-500">Mặc định: 'omniroute' (OmniRoute localhost proxy).</span>
       </div>
 
-      <div class="flex items-center justify-between pt-1 border-t border-slate-800">
-        <label class="flex items-center gap-2 text-[11px] text-slate-300 cursor-pointer">
-          <input id="aiAutoOpenCheckbox" type="checkbox" checked class="accent-emerald-500 rounded" />
+      <div class="flex items-center justify-between pt-1 border-t border-zinc-800">
+        <label class="flex items-center gap-1.5 text-[11px] text-zinc-300 cursor-pointer">
+          <input id="aiAutoOpenCheckbox" type="checkbox" checked class="accent-teal-500 rounded" />
           Tự động mở khi bấm Mark Correct
         </label>
-        <button onclick="saveChatSettings()" class="px-3 py-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded text-xs transition">
+        <button onclick="saveChatSettings()" class="px-3 py-1 bg-teal-600 hover:bg-teal-500 text-zinc-950 font-semibold rounded text-xs transition">
           Lưu
         </button>
       </div>
     </div>
 
     <!-- Quick Action Prompt Chips -->
-    <div class="p-2.5 bg-slate-900/50 border-b border-slate-800/60 flex flex-wrap gap-1.5 text-[11px]">
-      <button onclick="sendQuickPrompt('Tóm tắt nội dung và lời thoại chính của đoạn video này.')" class="px-2 py-1 bg-slate-800/80 hover:bg-slate-700 text-emerald-300 rounded-lg border border-emerald-500/20 transition truncate max-w-[195px]">
+    <div class="p-2 bg-zinc-900/60 border-b border-zinc-800/80 flex flex-wrap gap-1 text-[11px]">
+      <button onclick="sendQuickPrompt('Tóm tắt nội dung và lời thoại chính của đoạn video này.')" class="px-2 py-0.5 bg-zinc-800/80 hover:bg-zinc-700 text-teal-300 rounded-md border border-teal-500/20 transition truncate max-w-[190px]">
         🎙️ Tóm tắt đoạn này
       </button>
-      <button onclick="sendQuickPrompt('Gợi ý các từ khóa truy vấn tiếp theo dựa trên nội dung video này.')" class="px-2 py-1 bg-slate-800/80 hover:bg-slate-700 text-amber-300 rounded-lg border border-amber-500/20 transition truncate max-w-[195px]">
-        🔍 Gợi ý từ khóa tiếp
+      <button onclick="sendQuickPrompt('Gợi ý các từ khóa truy vấn tiếp theo dựa trên nội dung video này.')" class="px-2 py-0.5 bg-zinc-800/80 hover:bg-zinc-700 text-amber-300 rounded-md border border-amber-500/20 transition truncate max-w-[190px]">
+        🔍 Gợi ý từ khóa
       </button>
-      <button onclick="sendQuickPrompt('Các địa điểm, tổ chức, nhân vật và sự kiện xuất hiện trong cảnh này là gì?')" class="px-2 py-1 bg-slate-800/80 hover:bg-slate-700 text-teal-300 rounded-lg border border-teal-500/20 transition truncate max-w-[195px]">
-        🏢 Thực thể & Địa điểm
+      <button onclick="sendQuickPrompt('Các địa điểm, tổ chức, nhân vật và sự kiện xuất hiện trong cảnh này là gì?')" class="px-2 py-0.5 bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 rounded-md border border-zinc-700/40 transition truncate max-w-[190px]">
+        🏢 Thực thể & Sự kiện
       </button>
-      <button onclick="sendQuickPrompt('Liệt kê mốc thời gian chi tiết các sự kiện diễn ra trong video.')" class="px-2 py-1 bg-slate-800/80 hover:bg-slate-700 text-indigo-300 rounded-lg border border-indigo-500/20 transition truncate max-w-[195px]">
+      <button onclick="sendQuickPrompt('Liệt kê mốc thời gian chi tiết các sự kiện diễn ra trong video.')" class="px-2 py-0.5 bg-zinc-800/80 hover:bg-zinc-700 text-indigo-300 rounded-md border border-indigo-500/20 transition truncate max-w-[190px]">
         ⏱️ Mốc thời gian
+      </button>
     </div>
 
     <!-- Chat Messages Scroll Area -->
-    <div id="aiChatMessages" class="flex-1 p-4 overflow-y-auto flex flex-col gap-3 text-xs">
-      <div class="self-start max-w-[90%] p-3 rounded-2xl bg-slate-900 border border-slate-800 text-slate-300 leading-relaxed">
+    <div id="aiChatMessages" class="flex-1 p-3.5 overflow-y-auto flex flex-col gap-2.5 text-xs">
+      <div class="self-start max-w-[90%] p-3 rounded-2xl bg-zinc-900/90 border border-zinc-800 text-zinc-300 leading-relaxed">
         👋 Xin chào! Tôi là Trợ lý AI phân tích video. Khi bạn đánh dấu một video chính xác, tôi sẽ tự động trích xuất lời thoại ASR và chữ OCR của video đó để hỗ trợ bạn tóm tắt, trả lời câu hỏi và gợi ý truy vấn tiếp theo!
       </div>
     </div>
 
     <!-- Chat Input Area -->
-    <div class="p-3 bg-slate-900/90 border-t border-slate-800 flex items-end gap-2">
-      <textarea id="aiChatInput" rows="1" placeholder="Hỏi về video này... (Enter gửi, Shift+Enter xuống dòng)" class="flex-1 bg-slate-950 text-slate-100 placeholder-slate-500 text-xs rounded-xl px-3 py-2 border border-slate-700/60 focus:outline-none focus:ring-1 focus:ring-emerald-500/50 resize-none max-h-24" onkeydown="handleChatInputKey(event)"></textarea>
-      <button id="aiSendBtn" onclick="sendChatMessage()" class="p-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-xl transition shadow-md shadow-emerald-500/20 flex items-center justify-center">
+    <div class="p-2.5 bg-zinc-900/95 border-t border-zinc-800 flex items-end gap-2">
+      <textarea id="aiChatInput" rows="1" placeholder="Hỏi về video này... (Enter gửi, Shift+Enter xuống dòng)" class="flex-1 bg-zinc-950 text-zinc-100 placeholder-zinc-500 text-xs rounded-xl px-3 py-2 border border-zinc-800 focus:outline-none focus:border-teal-500/50 resize-none max-h-24" onkeydown="handleChatInputKey(event)"></textarea>
+      <button id="aiSendBtn" onclick="sendChatMessage()" class="p-2 bg-teal-600 hover:bg-teal-500 text-zinc-950 font-bold rounded-xl transition shadow-sm flex items-center justify-center active:scale-95">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path></svg>
       </button>
     </div>
@@ -2253,7 +2278,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (!toast) {
         toast = document.createElement('div');
         toast.id = 'quickToast';
-        toast.className = 'fixed top-20 right-6 z-50 glass px-4 py-2.5 rounded-xl border border-emerald-500/40 text-emerald-300 text-xs font-bold shadow-2xl transition-all duration-300 transform translate-y-0 opacity-100 flex items-center gap-2';
+        toast.className = 'fixed top-16 right-6 z-50 glass px-3.5 py-2 rounded-xl border border-teal-500/30 text-teal-300 text-xs font-medium shadow-xl transition-all duration-300 transform translate-y-0 opacity-100 flex items-center gap-2';
         document.body.appendChild(toast);
       }
       toast.innerHTML = msg;
@@ -2591,7 +2616,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const files = event.target.files;
       if (!files || files.length === 0) return;
 
-      showQuickToast("⏳ Đang giải nén và nạp gói câu hỏi...");
+      showQuickToast("⏳ Đang nạp gói câu hỏi...");
       let loadedQueries = [];
 
       try {
@@ -2644,13 +2669,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
             const btn = document.getElementById(`filterTab_${t}`);
             if (!btn) return;
             if (t === 'all') {
-              btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold bg-slate-800 text-white border border-slate-700 shadow-sm';
+              btn.className = 'flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold bg-zinc-800 text-zinc-100 border border-zinc-700 shadow-sm';
             } else if (t === 'kis') {
-              btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-sky-400 hover:bg-slate-900/60';
+              btn.className = 'flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold text-zinc-400 hover:text-teal-300 hover:bg-zinc-900/60';
             } else if (t === 'qa') {
-              btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-purple-400 hover:bg-slate-900/60';
+              btn.className = 'flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold text-zinc-400 hover:text-purple-300 hover:bg-zinc-900/60';
             } else if (t === 'trake') {
-              btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-amber-400 hover:bg-slate-900/60';
+              btn.className = 'flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold text-zinc-400 hover:text-amber-300 hover:bg-zinc-900/60';
             }
           });
 
@@ -2686,23 +2711,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (!btn) return;
         if (t === mode) {
           if (t === 'all') {
-            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold bg-slate-800 text-white border border-slate-700 shadow-sm';
+            btn.className = 'flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold bg-zinc-800 text-zinc-100 border border-zinc-700 shadow-sm';
           } else if (t === 'kis') {
-            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold bg-sky-500/20 text-sky-300 border border-sky-500/40 shadow-sm';
+            btn.className = 'flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold bg-teal-500/15 text-teal-300 border border-teal-500/30 shadow-sm';
           } else if (t === 'qa') {
-            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold bg-purple-500/20 text-purple-300 border border-purple-500/40 shadow-sm';
+            btn.className = 'flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold bg-purple-500/15 text-purple-300 border border-purple-500/30 shadow-sm';
           } else if (t === 'trake') {
-            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm';
+            btn.className = 'flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/30 shadow-sm';
           }
         } else {
           if (t === 'all') {
-            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-slate-400 hover:bg-slate-900/60';
+            btn.className = 'flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold text-zinc-400 hover:bg-zinc-900/60';
           } else if (t === 'kis') {
-            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-sky-400 hover:bg-slate-900/60';
+            btn.className = 'flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold text-zinc-400 hover:text-teal-300 hover:bg-zinc-900/60';
           } else if (t === 'qa') {
-            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-purple-400 hover:bg-slate-900/60';
+            btn.className = 'flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold text-zinc-400 hover:text-purple-300 hover:bg-zinc-900/60';
           } else if (t === 'trake') {
-            btn.className = 'flex-1 py-1.5 px-1.5 rounded-lg text-center transition text-[11px] font-bold text-amber-400 hover:bg-slate-900/60';
+            btn.className = 'flex-1 py-1.5 px-1 rounded-lg text-center transition text-[11px] font-semibold text-zinc-400 hover:text-amber-300 hover:bg-zinc-900/60';
           }
         }
       });
@@ -2750,10 +2775,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       if (!queryPackage || queryPackage.length === 0) {
         container.innerHTML = `
-          <div id="querySidebarEmptyState" class="py-12 text-center text-slate-500 text-xs flex flex-col items-center gap-2">
-            <span class="text-3xl">📂</span>
+          <div id="querySidebarEmptyState" class="py-12 text-center text-zinc-500 text-xs flex flex-col items-center gap-2">
+            <span class="text-2xl">📂</span>
             <span>Chưa có gói câu hỏi nào.</span>
-            <button onclick="document.getElementById('queryFileInput').click()" class="mt-1 px-3 py-1.5 bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-500/40 rounded-lg text-xs font-semibold transition">
+            <button onclick="document.getElementById('queryFileInput').click()" class="mt-1 px-3 py-1.5 bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 border border-teal-500/30 rounded-lg text-xs font-medium transition">
               Upload Queries (.zip)
             </button>
           </div>
@@ -2777,9 +2802,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       if (filtered.length === 0) {
         container.innerHTML = `
-          <div class="py-8 text-center text-slate-500 text-xs flex flex-col items-center gap-1.5">
+          <div class="py-8 text-center text-zinc-500 text-xs flex flex-col items-center gap-1.5">
             <span>🔍 Không tìm thấy query phù hợp</span>
-            <button onclick="clearSidebarFilter(); setSidebarModeFilter('all');" class="text-indigo-400 hover:underline text-[11px]">
+            <button onclick="clearSidebarFilter(); setSidebarModeFilter('all');" class="text-teal-400 hover:underline text-[11px]">
               Xóa bộ lọc
             </button>
           </div>
@@ -2802,16 +2827,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
           ));
 
           let modeBadge = 'KIS';
-          let modeColor = 'bg-sky-950/90 text-sky-400 border border-sky-800/40';
+          let modeColor = 'bg-teal-500/10 text-teal-300 border border-teal-500/20';
           let rowCountText = '100 rows';
 
           if (q.mode === 'qa') {
             modeBadge = 'QA';
-            modeColor = 'bg-purple-950/90 text-purple-300 border border-purple-800/40';
+            modeColor = 'bg-purple-500/10 text-purple-300 border border-purple-500/20';
             rowCountText = '100 rows';
           } else if (q.mode === 'trake') {
             modeBadge = 'TRAKE';
-            modeColor = 'bg-amber-950/90 text-amber-300 border border-amber-800/40';
+            modeColor = 'bg-amber-500/10 text-amber-300 border border-amber-500/20';
             rowCountText = '20 rows';
           }
 
@@ -2836,10 +2861,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
           }
 
           const card = document.createElement('div');
-          card.className = `p-3 rounded-xl border transition-all cursor-pointer flex flex-col gap-1.5 ${
+          card.className = `p-2.5 rounded-xl border transition-all cursor-pointer flex flex-col gap-1.5 ${
             isSelected 
-              ? 'bg-[#13162b] border-indigo-500 ring-2 ring-indigo-500/40 shadow-lg shadow-indigo-500/10' 
-              : 'bg-[#0b0f19]/90 border-slate-800/80 hover:border-slate-700 hover:bg-slate-900/60'
+              ? 'bg-[#141829] border-teal-500/50 ring-1 ring-teal-500/30 shadow-sm' 
+              : 'bg-[#0f121d]/70 border-zinc-800/70 hover:border-zinc-700 hover:bg-[#151928]/80'
           }`;
           card.onclick = () => selectQuery(q.id);
 
@@ -2849,29 +2874,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
           card.innerHTML = `
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-1.5 min-w-0">
-                <span class="text-[10px] px-1.5 py-0.5 rounded font-mono font-bold ${modeColor}">${modeBadge}</span>
-                <span class="font-mono font-bold text-xs truncate ${isSelected ? 'text-white' : 'text-slate-200'}">${safeId}</span>
+                <span class="text-[10px] px-1.5 py-0.2 rounded font-mono font-semibold ${modeColor}">${modeBadge}</span>
+                <span class="font-mono font-semibold text-xs truncate ${isSelected ? 'text-zinc-100' : 'text-zinc-300'}">${safeId}</span>
               </div>
               <div class="flex items-center gap-1.5 flex-shrink-0">
                 ${isSaved ? `
-                  <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-semibold flex items-center gap-0.5">
+                  <span class="text-[10px] px-1.5 py-0.2 rounded-full bg-teal-500/15 text-teal-300 border border-teal-500/25 font-medium flex items-center gap-0.5">
                     ✓ Saved
                   </span>
                 ` : `
-                  <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-slate-800 text-slate-400 font-medium">
+                  <span class="text-[10px] px-1.5 py-0.2 rounded-full bg-zinc-800/80 text-zinc-400 font-medium border border-zinc-700/50">
                     ○ Pending
                   </span>
                 `}
-                <span class="text-[10px] font-mono text-emerald-400/90 font-medium">${rowCountText}</span>
+                <span class="text-[10px] font-mono text-zinc-400 font-medium">${rowCountText}</span>
               </div>
             </div>
 
-            <p class="text-[11px] text-slate-400 line-clamp-2 leading-relaxed font-sans mt-0.5">
-              ${safePrompt || '<i class="text-slate-600">(Trống - click để tìm kiếm)</i>'}
+            <p class="text-[11px] text-zinc-400 line-clamp-2 leading-relaxed font-sans mt-0.5">
+              ${safePrompt || '<i class="text-zinc-600">(Trống - click để tìm kiếm)</i>'}
             </p>
 
             ${savedSummary ? `
-              <div class="text-[10px] text-emerald-400/90 font-mono bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-800/40 truncate mt-0.5">
+              <div class="text-[10px] text-teal-300/90 font-mono bg-zinc-900/80 px-2 py-0.5 rounded border border-zinc-800 truncate mt-0.5">
                 ${savedSummary}
               </div>
             ` : ''}
@@ -3363,19 +3388,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
       badge.innerText = `${events.length} events`;
 
       if (events.length === 0) {
-        container.innerHTML = `<span class="text-slate-500 text-[11px] italic">Chưa có mốc sự kiện nào. Hãy tua video và bấm "+ Mark Current Frame".</span>`;
+        container.innerHTML = `<span class="text-zinc-500 text-[11px] italic">Chưa có mốc sự kiện nào. Hãy tua video và bấm "+ Mark Frame".</span>`;
         return;
       }
 
       container.innerHTML = '';
       events.forEach((ev, idx) => {
         const chip = document.createElement('div');
-        chip.className = 'flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-950/80 border border-indigo-500/50 text-indigo-200 text-xs shadow-sm';
+        chip.className = 'flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-zinc-900 border border-zinc-700 text-zinc-200 text-xs shadow-sm';
         chip.innerHTML = `
-          <span class="font-bold text-indigo-400">#${idx + 1}</span>
-          <span class="font-mono font-bold">F${ev.frame_idx}</span>
-          <span class="text-[10px] text-slate-400 font-mono">(${formatTime(ev.pts_time)})</span>
-          <button onclick="removeTrakeEvent('${vid}', ${ev.frame_idx})" class="ml-1 text-slate-400 hover:text-rose-400 font-bold" title="Xóa mốc sự kiện này">✕</button>
+          <span class="font-semibold text-indigo-400">#${idx + 1}</span>
+          <span class="font-mono font-semibold text-zinc-100">F${ev.frame_idx}</span>
+          <span class="text-[10px] text-zinc-500 font-mono">(${formatTime(ev.pts_time)})</span>
+          <button onclick="removeTrakeEvent('${vid}', ${ev.frame_idx})" class="ml-1 text-zinc-400 hover:text-rose-400 font-bold" title="Xóa mốc sự kiện này">✕</button>
         `;
         container.appendChild(chip);
       });
@@ -3464,32 +3489,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
     }
 
+    // --- Modal Clip Marking ---
     function setModalClipStart() {
-      if (!videoElem) return;
-      modalClipStartSec = Math.max(0, parseFloat(videoElem.currentTime.toFixed(2)));
+      if (!currentModalItem) return;
+      modalClipStartSec = videoElem && !isNaN(videoElem.currentTime) ? videoElem.currentTime : 0;
       document.getElementById('modalClipStartBadge').innerText = formatTime(modalClipStartSec);
-      if (currentModalItem) {
-        const vid = currentModalItem.video_id;
-        if (!videoClipRanges[vid]) videoClipRanges[vid] = {};
-        videoClipRanges[vid].start_sec = modalClipStartSec;
-        if (currentActiveChatVideo && currentActiveChatVideo.video_id === vid) {
-          syncClipRangeToUI(vid);
-        }
-      }
+      
+      const vid = currentModalItem.video_id;
+      if (!videoClipRanges[vid]) videoClipRanges[vid] = {};
+      videoClipRanges[vid].start_sec = parseFloat(modalClipStartSec.toFixed(2));
+      
+      showQuickToast(`⏱️ Đã đặt Start: ${formatTime(modalClipStartSec)} (${modalClipStartSec.toFixed(1)}s)`);
+      syncClipRangeToUI(vid);
     }
 
     function setModalClipEnd() {
-      if (!videoElem) return;
-      modalClipEndSec = Math.max(0, parseFloat(videoElem.currentTime.toFixed(2)));
+      if (!currentModalItem) return;
+      modalClipEndSec = videoElem && !isNaN(videoElem.currentTime) ? videoElem.currentTime : 0;
       document.getElementById('modalClipEndBadge').innerText = formatTime(modalClipEndSec);
-      if (currentModalItem) {
-        const vid = currentModalItem.video_id;
-        if (!videoClipRanges[vid]) videoClipRanges[vid] = {};
-        videoClipRanges[vid].end_sec = modalClipEndSec;
-        if (currentActiveChatVideo && currentActiveChatVideo.video_id === vid) {
-          syncClipRangeToUI(vid);
-        }
-      }
+
+      const vid = currentModalItem.video_id;
+      if (!videoClipRanges[vid]) videoClipRanges[vid] = {};
+      videoClipRanges[vid].end_sec = parseFloat(modalClipEndSec.toFixed(2));
+
+      showQuickToast(`⏱️ Đã đặt End: ${formatTime(modalClipEndSec)} (${modalClipEndSec.toFixed(1)}s)`);
+      syncClipRangeToUI(vid);
     }
 
     function askVlmFromModalClip() {
@@ -3511,6 +3535,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       openChatbotForVideo(vid, fid, pts, true);
     }
 
+    // --- Clip Range Marking for Chat ---
     function setClipStartFromPlayer() {
       const cur = videoElem && !isNaN(videoElem.currentTime) ? videoElem.currentTime : 0;
       document.getElementById('aiClipStartInput').value = cur.toFixed(2);
@@ -3541,7 +3566,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const badge = document.getElementById('aiClipDurationBadge');
 
       if (stVal === '' || etVal === '') {
-        badge.className = 'font-mono text-[10px] px-2 py-0.5 rounded bg-slate-950 text-amber-400 border border-slate-800 font-medium';
+        badge.className = 'font-mono text-[10px] px-2 py-0.5 rounded bg-zinc-950 text-zinc-400 border border-zinc-800 font-medium';
         badge.innerText = 'Chưa đánh dấu';
         return;
       }
@@ -3550,19 +3575,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const et = parseFloat(etVal);
 
       if (isNaN(st) || isNaN(et)) {
-        badge.className = 'font-mono text-[10px] px-2 py-0.5 rounded bg-slate-950 text-amber-400 border border-slate-800 font-medium';
+        badge.className = 'font-mono text-[10px] px-2 py-0.5 rounded bg-zinc-950 text-zinc-400 border border-zinc-800 font-medium';
         badge.innerText = 'Chưa hoàn tất';
         return;
       }
 
       if (st < 0 || st >= et) {
-        badge.className = 'font-mono text-[10px] px-2 py-0.5 rounded bg-rose-950/80 text-rose-300 border border-rose-800 font-bold';
+        badge.className = 'font-mono text-[10px] px-2 py-0.5 rounded bg-rose-950/80 text-rose-300 border border-rose-800 font-semibold';
         badge.innerText = `Lỗi: Start ≥ End`;
         return;
       }
 
       const dur = et - st;
-      badge.className = 'font-mono text-[10px] px-2 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-700 font-bold';
+      badge.className = 'font-mono text-[10px] px-2 py-0.5 rounded bg-teal-500/15 text-teal-300 border border-teal-500/30 font-semibold';
       badge.innerText = `⏱️ ${dur.toFixed(1)}s (${st.toFixed(1)}s → ${et.toFixed(1)}s)`;
 
       if (!videoClipRanges[vid]) videoClipRanges[vid] = {};
@@ -3707,7 +3732,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       if (!currentActiveChatVideo) {
         container.innerHTML = `
-          <div class="self-start max-w-[90%] p-3 rounded-2xl bg-slate-900 border border-slate-800 text-slate-300 leading-relaxed">
+          <div class="self-start max-w-[90%] p-3 rounded-2xl bg-zinc-900/90 border border-zinc-800 text-zinc-400 leading-relaxed text-xs">
             👋 Hãy chọn hoặc đánh dấu một video chính xác để bắt đầu phân tích!
           </div>
         `;
@@ -3719,13 +3744,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       // Initial context banner bubble
       const banner = document.createElement('div');
-      banner.className = 'self-start max-w-[95%] p-3 rounded-2xl bg-slate-900/90 border border-emerald-500/20 text-slate-300 leading-relaxed shadow-sm';
+      banner.className = 'self-start max-w-[95%] p-3 rounded-2xl bg-zinc-900/90 border border-teal-500/20 text-zinc-300 leading-relaxed shadow-sm';
       banner.innerHTML = `
-        <div class="flex items-center gap-1.5 text-emerald-400 font-semibold mb-1">
+        <div class="flex items-center gap-1.5 text-teal-400 font-semibold mb-1 text-xs">
           <span>🎬 Đang phân tích: <b>${vid}</b></span>
-          <span class="text-[10px] text-slate-400 font-mono">(${currentActiveChatVideo.frame_idx}f • ${currentActiveChatVideo.pts_time}s)</span>
+          <span class="text-[10px] text-zinc-400 font-mono">(${currentActiveChatVideo.frame_idx}f • ${currentActiveChatVideo.pts_time}s)</span>
         </div>
-        <p class="text-[11px] text-slate-400">VLM sẽ nhận chuỗi video frames của đoạn clip được đánh dấu cùng lời thoại ASR & OCR để trả lời chính xác nhất!</p>
+        <p class="text-[11px] text-zinc-400">VLM sẽ nhận chuỗi video frames của đoạn clip được đánh dấu cùng lời thoại ASR & OCR để trả lời chính xác nhất!</p>
       `;
       container.appendChild(banner);
 
@@ -3734,18 +3759,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const isUser = msg.role === 'user';
         const bubble = document.createElement('div');
         bubble.className = isUser
-          ? 'self-end max-w-[85%] p-3 rounded-2xl bg-emerald-600 text-white leading-relaxed shadow-md'
-          : 'self-start max-w-[92%] p-3 rounded-2xl bg-slate-900 border border-slate-800 text-slate-200 leading-relaxed shadow-md';
+          ? 'self-end max-w-[85%] p-3 rounded-2xl bg-teal-600 text-white leading-relaxed shadow-sm text-xs'
+          : 'self-start max-w-[92%] p-3 rounded-2xl bg-zinc-900/90 border border-zinc-800 text-zinc-200 leading-relaxed shadow-sm text-xs';
 
         if (isUser) {
           bubble.innerText = msg.content;
         } else {
           bubble.innerHTML = `
-            <div class="flex items-center justify-between gap-2 mb-1.5 pb-1 border-b border-slate-800/80">
-              <span class="font-bold text-[10px] text-emerald-400 flex items-center gap-1">🤖 VLM Video Analyst</span>
+            <div class="flex items-center justify-between gap-2 mb-1.5 pb-1 border-b border-zinc-800">
+              <span class="font-semibold text-[10px] text-teal-400 flex items-center gap-1">🤖 VLM Video Analyst</span>
               <div class="flex items-center gap-2">
-                <button onclick="useAIResponseAsQA(${JSON.stringify(msg.content)})" class="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 border border-amber-500/40 font-semibold transition" title="Đặt câu trả lời này làm đáp án Q&A">✍️ Chọn làm Answer</button>
-                <button onclick="copyText(this, ${JSON.stringify(msg.content)})" class="text-[10px] text-slate-400 hover:text-white transition">📋 Copy</button>
+                <button onclick="useAIResponseAsQA(${JSON.stringify(msg.content)})" class="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 border border-amber-500/30 font-semibold transition" title="Đặt câu trả lời này làm đáp án Q&A">✍️ Chọn làm Answer</button>
+                <button onclick="copyText(this, ${JSON.stringify(msg.content)})" class="text-[10px] text-zinc-400 hover:text-zinc-200 transition">📋 Copy</button>
               </div>
             </div>
             <div class="prose-content leading-relaxed">${formatMarkdown(msg.content)}</div>
@@ -3765,17 +3790,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .replace(/>/g, '&gt;');
 
       // Code blocks
-      safe = safe.replace(/```([\s\S]*?)```/g, '<pre class="bg-slate-950 p-2.5 rounded-lg my-1.5 font-mono text-[11px] text-emerald-300 overflow-x-auto border border-slate-800"><code>$1</code></pre>');
+      safe = safe.replace(/```([\s\S]*?)```/g, '<pre class="bg-zinc-950 p-2.5 rounded-lg my-1.5 font-mono text-[11px] text-teal-300 overflow-x-auto border border-zinc-800"><code>$1</code></pre>');
       // Inline code
-      safe = safe.replace(/`([^`]+)`/g, '<code class="bg-slate-950 text-emerald-300 px-1 py-0.5 rounded font-mono text-[11px] border border-slate-800">$1</code>');
+      safe = safe.replace(/`([^`]+)`/g, '<code class="bg-zinc-950 text-teal-300 px-1 py-0.5 rounded font-mono text-[11px] border border-zinc-800">$1</code>');
       // Blockquotes
-      safe = safe.replace(/^>\s+(.*)$/gm, '<blockquote class="border-l-2 border-emerald-500/60 pl-2 text-slate-400 my-1 text-[11px]">$1</blockquote>');
+      safe = safe.replace(/^>\s+(.*)$/gm, '<blockquote class="border-l-2 border-teal-500/60 pl-2 text-zinc-400 my-1 text-[11px]">$1</blockquote>');
       // Bold
       safe = safe.replace(/\*\*([^*]+)\*\*/g, '<b class="text-white font-semibold">$1</b>');
       // Bullet lists
-      safe = safe.replace(/^[•\-\*]\s+(.*)$/gm, '<li class="ml-4 list-disc text-slate-200 my-0.5">$1</li>');
+      safe = safe.replace(/^[•\-\*]\s+(.*)$/gm, '<li class="ml-4 list-disc text-zinc-200 my-0.5">$1</li>');
       // Numbered lists
-      safe = safe.replace(/^\d+\.\s+(.*)$/gm, '<li class="ml-4 list-decimal text-slate-200 my-0.5">$1</li>');
+      safe = safe.replace(/^\d+\.\s+(.*)$/gm, '<li class="ml-4 list-decimal text-zinc-200 my-0.5">$1</li>');
       // Linebreaks
       safe = safe.replace(/\n/g, '<br/>');
       return safe;
@@ -3851,9 +3876,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const container = document.getElementById('aiChatMessages');
       const loadingBubble = document.createElement('div');
       loadingBubble.id = 'aiChatLoadingBubble';
-      loadingBubble.className = 'self-start max-w-[85%] p-3 rounded-2xl bg-slate-900 border border-slate-800 text-slate-400 text-xs flex items-center gap-2 animate-pulse';
+      loadingBubble.className = 'self-start max-w-[85%] p-3 rounded-2xl bg-zinc-900/90 border border-zinc-800 text-zinc-400 text-xs flex items-center gap-2 animate-pulse';
       loadingBubble.innerHTML = `
-        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
+        <span class="w-2 h-2 rounded-full bg-teal-400 animate-ping"></span>
         <span>🎞️ Đang trích xuất frames từ clip [${startSec.toFixed(1)}s - ${endSec.toFixed(1)}s] & gửi VLM...</span>
       `;
       container.appendChild(loadingBubble);
@@ -3923,9 +3948,46 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('modalCurrentFrame').innerText = `${currentFrame} (${formatTime(currentSec)}.${Math.floor((currentSec%1)*100)})`;
     };
 
-    function updateWeights() {
-      document.getElementById('wDenseVal').innerText = parseFloat(document.getElementById('wDense').value).toFixed(2);
-      document.getElementById('wASRVal').innerText = parseFloat(document.getElementById('wASR').value).toFixed(2);
+    let isAutoTune = true;
+
+    function onBalanceSliderChange() {
+      const val = parseInt(document.getElementById('fusionBalance').value);
+      const densePct = val;
+      const asrPct = 100 - val;
+      document.getElementById('wDenseVal').innerText = `${densePct}%`;
+      document.getElementById('wASRVal').innerText = `${asrPct}%`;
+      
+      // Direct slider drag switches to manual mode
+      isAutoTune = false;
+      updateAutoTuneBadgeUI(false, "Manual");
+    }
+
+    function toggleAutoTune() {
+      isAutoTune = !isAutoTune;
+      if (isAutoTune) {
+        updateAutoTuneBadgeUI(true, "Auto-Tune");
+        if (document.getElementById('queryInput').value.trim()) {
+          executeSearch();
+        }
+      } else {
+        updateAutoTuneBadgeUI(false, "Manual");
+      }
+    }
+
+    function updateAutoTuneBadgeUI(isAuto, label) {
+      const btn = document.getElementById('autoTuneBtn');
+      const icon = document.getElementById('autoTuneIcon');
+      const text = document.getElementById('autoTuneText');
+      if (!btn) return;
+      if (isAuto) {
+        btn.className = "ml-1.5 px-2 py-0.5 rounded text-[11px] font-medium bg-zinc-800 text-teal-300 border border-zinc-700 hover:bg-zinc-700 transition-all flex items-center gap-1 cursor-pointer";
+        icon.innerText = "✨";
+        text.innerText = label || "Auto-Tune";
+      } else {
+        btn.className = "ml-1.5 px-2 py-0.5 rounded text-[11px] font-medium bg-zinc-800 text-amber-300 border border-zinc-700 hover:bg-zinc-700 transition-all flex items-center gap-1 cursor-pointer";
+        icon.innerText = "⚙️";
+        text.innerText = "Manual (Click Auto)";
+      }
     }
 
     // --- Keyword Emphasis & Exact Matching ---
@@ -3999,27 +4061,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
       keywordsList.forEach(kw => {
         const chip = document.createElement('div');
         const isExact = kw.exact;
-        const chipBorder = isExact ? 'border-amber-500/50 bg-amber-950/20' : 'border-emerald-500/40 bg-slate-900';
-        const tagColor = isExact ? 'text-amber-300' : 'text-emerald-300';
+        const chipBorder = isExact ? 'border-sky-500/30 bg-zinc-900/90' : 'border-teal-500/30 bg-zinc-900/90';
+        const tagColor = isExact ? 'text-sky-300' : 'text-teal-300';
         const modeLabel = isExact ? '🔤 EXACT' : '🧠 SEMANTIC';
 
-        chip.className = `flex items-center gap-2 ${chipBorder} border px-2.5 py-1.5 rounded-lg text-xs shadow-sm`;
+        chip.className = `flex items-center gap-2 ${chipBorder} border px-2.5 py-1 rounded-lg text-xs shadow-sm`;
         chip.innerHTML = `
-          <button onclick="toggleKeywordMode(${kw.id})" class="text-[10px] font-bold px-1.5 py-0.5 rounded ${isExact ? 'bg-amber-500/30 text-amber-300' : 'bg-emerald-500/20 text-emerald-300'} hover:opacity-80 transition" title="Click to toggle between Exact Match and Semantic Mode">
+          <button onclick="toggleKeywordMode(${kw.id})" class="text-[10px] font-semibold px-1.5 py-0.5 rounded ${isExact ? 'bg-sky-500/20 text-sky-300' : 'bg-teal-500/20 text-teal-300'} hover:opacity-80 transition" title="Click to toggle between Exact Match and Semantic Mode">
             ${modeLabel}
           </button>
           <span class="font-medium ${tagColor}">"${kw.text}"</span>
-          <div class="flex items-center gap-1 border-l border-slate-700/60 pl-2">
-            <input type="range" min="0.1" max="2.0" step="0.1" value="${kw.weight}" class="w-14 accent-emerald-500" oninput="updateKeywordWeight(${kw.id}, this.value)" onchange="onKeywordWeightChange()">
-            <span id="kwVal_${kw.id}" class="text-slate-400 font-mono text-[10px] w-6">${kw.weight.toFixed(1)}x</span>
+          <div class="flex items-center gap-1 border-l border-zinc-800 pl-2">
+            <input type="range" min="0.1" max="2.0" step="0.1" value="${kw.weight}" class="w-14 accent-teal-500" oninput="updateKeywordWeight(${kw.id}, this.value)" onchange="onKeywordWeightChange()">
+            <span id="kwVal_${kw.id}" class="text-zinc-400 font-mono text-[10px] w-6">${kw.weight.toFixed(1)}x</span>
           </div>
-          <button onclick="removeKeyword(${kw.id})" class="text-slate-400 hover:text-rose-400 text-xs ml-1 font-bold">✕</button>
+          <button onclick="removeKeyword(${kw.id})" class="text-zinc-400 hover:text-rose-400 text-xs ml-1 font-bold">✕</button>
         `;
         container.appendChild(chip);
       });
     }
 
-    // --- Correct Marks Management ---
     // --- Correct Marks Management ---
     function toggleMark(vid, fid, pts, event) {
       if (event) event.stopPropagation();
@@ -4075,20 +4136,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
       markedMap.clear();
       updateMarkedUI();
 
-      const wDense = parseFloat(document.getElementById('wDense').value);
-      const wASR = parseFloat(document.getElementById('wASR').value);
+      const fusionVal = parseInt(document.getElementById('fusionBalance').value);
+      const wDense = isAutoTune ? null : (fusionVal / 100.0);
+      const wASR = isAutoTune ? null : ((100 - fusionVal) / 100.0);
       const topK = parseInt(document.getElementById('topKSelect').value);
 
-      document.getElementById('statusText').innerHTML = `<span class="animate-pulse text-emerald-400">Searching multi-modal index across 177k frames + BM25 speech...</span>`;
+      document.getElementById('statusText').innerHTML = `<span class="animate-pulse text-teal-400 font-medium">Searching multi-modal index across 285k frames + BM25 speech...</span>`;
 
       try {
         const res = await fetch('/api/search', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query: q, keywords: keywordsList, w_dense: wDense, w_asr: wASR, top_k: topK })
+          body: JSON.stringify({ query: q, keywords: keywordsList, w_dense: wDense, w_asr: wASR, auto_tune: isAutoTune, top_k: topK })
         });
         const data = await res.json();
         currentResults = data.results || [];
+
+        // If in Auto-Tune mode, automatically sync slider to detected weights & label
+        if (isAutoTune && data.effective_weights) {
+          const effWDense = data.effective_weights.w_dense;
+          const sliderPct = Math.round(effWDense * 100);
+          document.getElementById('fusionBalance').value = sliderPct;
+          document.getElementById('wDenseVal').innerText = `${sliderPct}%`;
+          document.getElementById('wASRVal').innerText = `${100 - sliderPct}%`;
+          updateAutoTuneBadgeUI(true, data.category_label ? `Auto: ${data.category_label}` : "Auto-Tune");
+        }
 
         document.getElementById('transQuery').innerText = data.translated_query || 'N/A';
         document.getElementById('statusText').innerText = '';
@@ -4111,11 +4183,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const marked_items = Array.from(markedMap.values());
       if (marked_items.length === 0) return;
 
-      const wDense = parseFloat(document.getElementById('wDense').value);
-      const wASR = parseFloat(document.getElementById('wASR').value);
+      const fusionVal = parseInt(document.getElementById('fusionBalance').value);
+      const wDense = isAutoTune ? null : (fusionVal / 100.0);
+      const wASR = isAutoTune ? null : ((100 - fusionVal) / 100.0);
       const topK = parseInt(document.getElementById('topKSelect').value);
 
-      document.getElementById('statusText').innerHTML = `<span class="animate-pulse text-emerald-400">Re-ranking with ${marked_items.length} confirmed keyframe embeddings & scene proximity...</span>`;
+      document.getElementById('statusText').innerHTML = `<span class="animate-pulse text-teal-400 font-medium">Re-ranking with ${marked_items.length} confirmed keyframe embeddings & scene proximity...</span>`;
 
       try {
         const res = await fetch('/api/refine', {
@@ -4127,11 +4200,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
             keywords: keywordsList,
             w_dense: wDense,
             w_asr: wASR,
+            auto_tune: isAutoTune,
             top_k: topK
           })
         });
         const data = await res.json();
         currentResults = data.results || [];
+
+        if (isAutoTune && data.effective_weights) {
+          const effWDense = data.effective_weights.w_dense;
+          const sliderPct = Math.round(effWDense * 100);
+          document.getElementById('fusionBalance').value = sliderPct;
+          document.getElementById('wDenseVal').innerText = `${sliderPct}%`;
+          document.getElementById('wASRVal').innerText = `${100 - sliderPct}%`;
+        }
 
         document.getElementById('transQuery').innerText = data.translated_query || 'N/A';
         document.getElementById('statusText').innerText = '';
@@ -4164,7 +4246,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
 
       if (!displayItems || displayItems.length === 0) {
-        grid.innerHTML = `<div class="col-span-full py-16 text-center text-slate-500">No matching keyframes found${activeVideoFilter ? ` for video filter "${activeVideoFilter}"` : ''}.</div>`;
+        grid.innerHTML = `<div class="col-span-full py-16 text-center text-zinc-500 text-xs">No matching keyframes found${activeVideoFilter ? ` for video filter "${activeVideoFilter}"` : ''}.</div>`;
         return;
       }
 
@@ -4180,25 +4262,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
         const card = document.createElement('div');
         const borderClass = isPinned
-          ? 'border-2 border-amber-400 ring-2 ring-amber-500/40 shadow-amber-500/20'
+          ? 'border border-amber-400/80 ring-2 ring-amber-500/30 shadow-amber-500/10'
           : (isMarked 
-              ? 'border-2 border-emerald-400 ring-2 ring-emerald-500/30 shadow-emerald-500/20' 
-              : 'hover:border-emerald-500/50 hover:shadow-emerald-500/10');
+              ? 'border border-teal-500/80 ring-2 ring-teal-500/30 shadow-teal-500/10' 
+              : 'border border-zinc-800/80 hover:border-zinc-700');
 
-        card.className = `glass rounded-xl overflow-hidden shadow-lg ${borderClass} transition-all duration-200 flex flex-col group`;
+        card.className = `glass rounded-xl overflow-hidden shadow-sm ${borderClass} transition-all duration-200 flex flex-col group`;
 
         const matchPct = (Math.min(1.0, Math.max(0.0, item.score)) * 100).toFixed(1);
-        const rankColor = item.rank === 1 ? 'bg-amber-400 text-slate-950 font-bold' : (item.rank <= 3 ? 'bg-slate-200 text-slate-900 font-bold' : 'bg-slate-800 text-slate-300');
+        const rankColor = item.rank === 1 ? 'bg-amber-400 text-zinc-950 font-bold' : (item.rank <= 3 ? 'bg-zinc-200 text-zinc-900 font-bold' : 'bg-zinc-800 text-zinc-300');
 
         const qaAns = qaAnswersMap[vid];
         const trakeEvents = trakeEventsMap[vid] || [];
 
         card.innerHTML = `
-          <div class="relative aspect-video bg-slate-900 overflow-hidden cursor-pointer" onclick="openModal(${origIdx >= 0 ? origIdx : 0})">
+          <div class="relative aspect-video bg-zinc-900 overflow-hidden cursor-pointer" onclick="openModal(${origIdx >= 0 ? origIdx : 0})">
             <img src="${item.thumb_url}" loading="lazy" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" onerror="this.src='https://via.placeholder.com/480x270/0f172a/64748b?text=Frame+Preview'" />
             
             <div class="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-              <div class="w-12 h-12 rounded-full bg-emerald-500 text-slate-950 flex items-center justify-center font-bold pl-1 shadow-lg transform group-hover:scale-110 transition-transform">
+              <div class="w-10 h-10 rounded-full bg-teal-500 text-zinc-950 flex items-center justify-center font-bold pl-0.5 shadow-md transform group-hover:scale-110 transition-transform">
                 ▶
               </div>
             </div>
@@ -4207,80 +4289,80 @@ HTML_PAGE = r"""<!DOCTYPE html>
               #${item.rank}
             </div>
             ${isPinned ? `
-              <div class="absolute top-2 left-12 bg-amber-400 text-slate-950 px-2 py-0.5 rounded text-[11px] font-black shadow flex items-center gap-1 animate-pulse">
+              <div class="absolute top-2 left-12 bg-amber-400 text-zinc-950 px-2 py-0.5 rounded text-[11px] font-black shadow flex items-center gap-1 animate-pulse">
                 🎯 PINNED
               </div>
             ` : (isMarked ? `
-              <div class="absolute top-2 left-12 bg-emerald-500 text-slate-950 px-2 py-0.5 rounded text-[11px] font-bold shadow flex items-center gap-1">
+              <div class="absolute top-2 left-12 bg-teal-500 text-zinc-950 px-2 py-0.5 rounded text-[11px] font-bold shadow flex items-center gap-1">
                 ✓ MARKED
               </div>
             ` : '')}
-            <div class="absolute top-2 right-2 bg-slate-950/80 backdrop-blur-md px-2 py-0.5 rounded text-[11px] font-mono text-emerald-400 border border-emerald-500/20 font-bold">
+            <div class="absolute top-2 right-2 bg-zinc-950/80 backdrop-blur-md px-1.5 py-0.5 rounded text-[11px] font-mono text-teal-300 border border-teal-500/20 font-semibold">
               ${matchPct}%
             </div>
-            <div class="absolute bottom-2 right-2 bg-slate-950/80 px-1.5 py-0.5 rounded text-[10px] font-mono text-slate-300">
+            <div class="absolute bottom-2 right-2 bg-zinc-950/80 px-1.5 py-0.5 rounded text-[10px] font-mono text-zinc-400">
               ⏱ ${formatTime(item.pts_time)}
             </div>
           </div>
           
-          <div class="p-3.5 flex flex-col justify-between flex-1 gap-2.5">
+          <div class="p-3 flex flex-col justify-between flex-1 gap-2">
             <div>
               <div class="flex items-center justify-between text-xs">
-                <span class="font-bold text-slate-200 tracking-wide font-mono">${item.video_id}</span>
-                <span class="text-slate-400 font-mono">Frame ${item.frame_idx}</span>
+                <span class="font-bold text-zinc-200 tracking-wide font-mono">${item.video_id}</span>
+                <span class="text-zinc-400 font-mono">Frame ${item.frame_idx}</span>
               </div>
 
               ${item.matched_scene ? `
-                <div class="mt-1.5 text-[10px] text-sky-300 font-medium bg-sky-950/50 px-2 py-1 rounded-md border border-sky-800/50 line-clamp-2 leading-tight flex items-start gap-1">
-                  <span class="text-sky-400 font-bold whitespace-nowrap">🎯 Matched:</span>
+                <div class="mt-1.5 text-[10px] text-zinc-300 font-medium bg-zinc-900/70 px-2 py-1 rounded-md border border-zinc-800 line-clamp-2 leading-tight flex items-start gap-1">
+                  <span class="text-teal-400 font-semibold whitespace-nowrap">🎯 Matched:</span>
                   <span class="italic truncate">${item.matched_scene}</span>
                 </div>
               ` : ''}
 
               <!-- Task Mode Badges on Card -->
               ${currentTaskMode === 'qa' ? `
-                <div class="mt-2 text-[11px] ${qaAns ? 'bg-amber-950/40 border-amber-500/40 text-amber-200' : 'bg-slate-900 border-slate-800 text-slate-500 italic'} p-2 rounded-lg border leading-relaxed flex items-start gap-1">
-                  <span class="font-bold text-amber-400 whitespace-nowrap">💬 Answer:</span>
+                <div class="mt-2 text-[11px] ${qaAns ? 'bg-amber-500/10 border-amber-500/30 text-amber-200' : 'bg-zinc-900/60 border-zinc-800 text-zinc-500 italic'} p-2 rounded-lg border leading-relaxed flex items-start gap-1">
+                  <span class="font-semibold text-amber-400 whitespace-nowrap">💬 Answer:</span>
                   <span class="truncate font-medium">${qaAns ? `"${qaAns}"` : '(Chưa có đáp án - Click Play hoặc AI để nhập)'}</span>
                 </div>
               ` : ''}
 
               ${currentTaskMode === 'trake' ? `
-                <div class="mt-2 text-[11px] ${trakeEvents.length > 0 ? 'bg-indigo-950/40 border-indigo-500/40 text-indigo-200' : 'bg-slate-900 border-slate-800 text-slate-500 italic'} p-2 rounded-lg border leading-relaxed">
-                  <span class="font-bold text-indigo-400">⏱️ TRAKE:</span> ${trakeEvents.length > 0 ? `<b>${trakeEvents.length} events</b> [${trakeEvents.map(e => 'F' + e.frame_idx).join(', ')}]` : '(Chưa có events - Click Play để đánh dấu chuỗi)'}
+                <div class="mt-2 text-[11px] ${trakeEvents.length > 0 ? 'bg-indigo-500/10 border-indigo-500/30 text-indigo-200' : 'bg-zinc-900/60 border-zinc-800 text-zinc-500 italic'} p-2 rounded-lg border leading-relaxed">
+                  <span class="font-semibold text-indigo-400">⏱️ TRAKE:</span> ${trakeEvents.length > 0 ? `<b>${trakeEvents.length} events</b> [${trakeEvents.map(e => 'F' + e.frame_idx).join(', ')}]` : '(Chưa có events - Click Play để đánh dấu chuỗi)'}
                 </div>
               ` : ''}
               
               ${item.matched_asr ? `
-                <div class="mt-2 text-[11px] text-emerald-200 italic bg-emerald-950/40 p-2.5 rounded-lg border border-emerald-800/40 line-clamp-3 leading-relaxed">
+                <div class="mt-2 text-[11px] text-zinc-300 italic bg-zinc-900/70 p-2 rounded-lg border border-zinc-800 line-clamp-3 leading-relaxed">
                   🎙️ "${item.matched_asr}"
                 </div>` : ''}
             </div>
 
-            <div class="flex items-center gap-1.5 pt-2 border-t border-slate-800/60 flex-wrap">
-              <button onclick="toggleMark('${item.video_id}', ${item.frame_idx}, ${item.pts_time}, event)" class="flex-1 py-1.5 ${isMarked ? 'bg-emerald-500 text-slate-950 font-bold shadow-md shadow-emerald-500/20' : 'bg-slate-800 hover:bg-slate-700 text-emerald-400'} text-[11px] font-semibold rounded transition flex items-center justify-center gap-1">
+            <div class="flex items-center gap-1.5 pt-2 border-t border-zinc-800/80 flex-wrap">
+              <button onclick="toggleMark('${item.video_id}', ${item.frame_idx}, ${item.pts_time}, event)" class="flex-1 py-1.5 ${isMarked ? 'bg-teal-500 text-zinc-950 font-semibold shadow-sm' : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300'} text-[11px] font-medium rounded transition flex items-center justify-center gap-1">
                 ${isMarked ? '✓ Correct' : '+ Mark'}
               </button>
-              <button onclick="isolateVideo('${item.video_id}'); event.stopPropagation();" class="px-2 py-1.5 bg-slate-800 hover:bg-slate-700 text-sky-300 border border-sky-500/20 text-[11px] font-semibold rounded transition flex items-center gap-1" title="Chỉ hiển thị các khung hình thuộc video ${item.video_id}">
+              <button onclick="isolateVideo('${item.video_id}'); event.stopPropagation();" class="px-2 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 text-[11px] font-medium rounded transition flex items-center gap-1" title="Chỉ hiển thị các khung hình thuộc video ${item.video_id}">
                 🎬 Isolate
               </button>
               ${currentTaskMode === 'trake' ? `
-                <button onclick="saveTrakeForCard('${item.video_id}', ${item.frame_idx}, ${item.pts_time}, event)" class="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-bold rounded transition flex items-center gap-1 shadow-sm" title="Lưu video này làm đáp án TRAKE cho câu query">
+                <button onclick="saveTrakeForCard('${item.video_id}', ${item.frame_idx}, ${item.pts_time}, event)" class="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-medium rounded transition flex items-center gap-1 shadow-sm" title="Lưu video này làm đáp án TRAKE cho câu query">
                   💾 Save
                 </button>
               ` : ''}
               ${currentTaskMode === 'qa' ? `
-                <button onclick="saveQAPromptForCard('${item.video_id}', ${item.frame_idx}, ${item.pts_time}, event)" class="px-2.5 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 text-[11px] font-bold rounded transition flex items-center gap-1 shadow-sm" title="Nhập và lưu đáp án Q&A">
+                <button onclick="saveQAPromptForCard('${item.video_id}', ${item.frame_idx}, ${item.pts_time}, event)" class="px-2.5 py-1.5 bg-amber-500 hover:bg-amber-400 text-zinc-950 text-[11px] font-medium rounded transition flex items-center gap-1 shadow-sm" title="Nhập và lưu đáp án Q&A">
                   💾 Save
                 </button>
               ` : ''}
-              <button onclick="openChatbotForVideo('${item.video_id}', ${item.frame_idx}, ${item.pts_time}, true); event.stopPropagation();" class="px-2 py-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-[11px] font-semibold rounded transition flex items-center gap-1" title="Hỏi Trợ lý AI về video/clip này">
+              <button onclick="openChatbotForVideo('${item.video_id}', ${item.frame_idx}, ${item.pts_time}, true); event.stopPropagation();" class="px-2 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-teal-300 border border-teal-500/25 text-[11px] font-medium rounded transition flex items-center gap-1" title="Hỏi Trợ lý AI về video/clip này">
                 🤖 AI
               </button>
-              <button onclick="copySubmission('${item.video_id}', ${item.frame_idx}, this)" class="px-2 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-semibold rounded transition flex items-center justify-center gap-1">
+              <button onclick="copySubmission('${item.video_id}', ${item.frame_idx}, this)" class="px-2 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 text-[11px] font-medium rounded transition flex items-center justify-center gap-1">
                 📋 Copy
               </button>
-              <button onclick="openModal(${origIdx >= 0 ? origIdx : 0})" class="px-2 py-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-[11px] font-semibold rounded transition flex items-center gap-1">
+              <button onclick="openModal(${origIdx >= 0 ? origIdx : 0})" class="px-2 py-1.5 bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 border border-teal-500/30 text-[11px] font-medium rounded transition flex items-center gap-1">
                 ▶ Play
               </button>
             </div>
@@ -4300,10 +4382,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       navigator.clipboard.writeText(`${vid},${fid}`);
       const orig = btn.innerText;
       btn.innerText = '✅ Copied!';
-      btn.classList.add('text-emerald-400');
+      btn.classList.add('text-teal-400');
       setTimeout(() => {
         btn.innerText = orig;
-        btn.classList.remove('text-emerald-400');
+        btn.classList.remove('text-teal-400');
       }, 1500);
     }
 
@@ -4333,9 +4415,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const pinStatus = document.getElementById('modalPinnedStatus');
       if (pinStatus) {
         if (isPinned) {
-          pinStatus.innerHTML = `<span class="text-amber-300 font-bold font-mono">🎯 Frame ${activeQ.savedData.pinnedFrame.frame_idx}</span>`;
+          pinStatus.innerHTML = `<span class="text-amber-300 font-semibold font-mono">🎯 Frame ${activeQ.savedData.pinnedFrame.frame_idx}</span>`;
         } else {
-          pinStatus.innerHTML = `<span class="text-slate-500 font-mono">Not Pinned</span>`;
+          pinStatus.innerHTML = `<span class="text-zinc-500 font-mono">Not Pinned</span>`;
         }
       }
 
@@ -4452,7 +4534,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       const pinStatus = document.getElementById('modalPinnedStatus');
       if (pinStatus) {
-        pinStatus.innerHTML = `<span class="text-amber-300 font-bold font-mono">🎯 Frame ${currentFrame} (${formatTime(currentSec)})</span>`;
+        pinStatus.innerHTML = `<span class="text-amber-300 font-semibold font-mono">🎯 Frame ${currentFrame} (${formatTime(currentSec)})</span>`;
       }
 
       updateMarkedUI();
@@ -4535,9 +4617,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       videoElem.playbackRate = spd;
       document.querySelectorAll('.speed-btn').forEach(btn => {
         if (parseFloat(btn.dataset.spd) === spd) {
-          btn.className = 'speed-btn px-2 py-1 bg-emerald-500 text-slate-950 font-bold rounded';
+          btn.className = 'speed-btn px-2 py-1 bg-zinc-800 text-teal-300 font-semibold rounded border border-teal-500/30';
         } else {
-          btn.className = 'speed-btn px-2 py-1 bg-slate-800 text-slate-300 rounded';
+          btn.className = 'speed-btn px-2 py-1 bg-zinc-900 text-zinc-400 rounded border border-zinc-800';
         }
       });
     }
@@ -4750,11 +4832,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/search":
                 q = str(payload.get("query", ""))
                 keywords = payload.get("keywords") if isinstance(payload.get("keywords"), list) else []
-                w_dense = payload.get("w_dense", 0.50)
-                w_asr = payload.get("w_asr", 0.50)
+                w_dense = payload.get("w_dense")
+                w_asr = payload.get("w_asr")
+                auto_tune = bool(payload.get("auto_tune", True if w_dense is None else False))
                 top_k = payload.get("top_k", 100)
 
-                res = ENGINE.search(q, keywords=keywords, w_dense=w_dense, w_asr=w_asr, top_k=top_k)
+                res = ENGINE.search(q, keywords=keywords, w_dense=w_dense, w_asr=w_asr, auto_tune=auto_tune, top_k=top_k)
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -4765,11 +4848,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 q = str(payload.get("query", ""))
                 marked_items = payload.get("marked_items") if isinstance(payload.get("marked_items"), list) else []
                 keywords = payload.get("keywords") if isinstance(payload.get("keywords"), list) else []
-                w_dense = payload.get("w_dense", 0.50)
-                w_asr = payload.get("w_asr", 0.50)
+                w_dense = payload.get("w_dense")
+                w_asr = payload.get("w_asr")
+                auto_tune = bool(payload.get("auto_tune", True if w_dense is None else False))
                 top_k = payload.get("top_k", 100)
 
-                res = ENGINE.refine(q, marked_items=marked_items, keywords=keywords, w_dense=w_dense, w_asr=w_asr, top_k=top_k)
+                res = ENGINE.refine(q, marked_items=marked_items, keywords=keywords, w_dense=w_dense, w_asr=w_asr, auto_tune=auto_tune, top_k=top_k)
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")

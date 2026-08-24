@@ -1,42 +1,108 @@
-Here's the full list, in priority order:
 
-## 1. Swap dense visual channel from CLIP ViT-B/32 → SigLIP
-Highest-leverage, near-free change since you already have SigLIP embeddings cached from the keyframe pipeline. Re-run the benchmark on this first before anything else.
+Improving Retrieval for News and TV Content
 
-## 2. Route `visual_entity_text_grounded` queries to OCR first, not CLIP/SigLIP
-This category (39% of the visual benchmark) scores worst under pure visual search because CLIP-family models are weak at reading on-screen text. You already have a PaddleOCR + BM25 index — send these queries there primarily, with dense visual as a secondary signal, instead of blending at a fixed global weight.
+Executive Summary: News and TV data pose unique challenges (noisy transcripts, rich metadata, temporal drift) but also opportunities (structured segments, overlay text). Common pitfalls include inconsistent or missing metadata (language, date, location), raw ASR/OCR output lacking punctuation or normalization, lexical gaps (synonyms, paraphrases), and outdated indexes. We propose a multi-stage pipeline: extensive data cleaning (normalize transcripts, incorporate video OCR text), rich indexing (sparse BM25 and dense vectors with FAISS), and a hybrid retrieval architecture (parallel BM25 and ANN search fused by Reciprocal Rank Fusion). Strong semantic encoders (DPR/ColBERT/ANCE/SPLADE) address vocabulary mismatch, while a second-stage cross-encoder reranker (BERT) refines top results. Queries are preprocessed (expansion, rewriting) to match news language. Relevance labels can be obtained via proxy (QA from transcripts or limited human judgments) and evaluated with standard IR metrics (nDCG@K, MRR, recall). Offline evaluations use held-out query sets and significance tests (paired t-test or Wilcoxon) to compare models; online A/B tests track user clicks/engagement. We detail an experimental plan (datasets, baselines, metrics) and compare candidate systems in tables (accuracy, latency, memory, complexity). Visual aids (pipeline flowchart, metrics charts, error analysis) are suggested to communicate the design. All proposals are grounded in primary sources (e.g. DPR, ColBERT, FAISS, hybrid retrieval, etc.) and practitioner guidelines (Elastic/FAISS docs, industry blogs). Below we cover each dimension in turn.
+Dataset Composition and Metadata Quality
 
-## 3. Per-category fusion weighting instead of one global config
-Your own category table shows `DIRECT_INFO`/`NUMERIC_TEMPORAL` peak at ASR-heavy (0.30/0.70) while `visual_compositional_objects` peaks at baseline (0.70/0.30) — opposite optima. Add a lightweight query-type classifier (heuristic or cheap LLM call) before retrieval to pick weights per detected category, using the taxonomy you've already built.
+Scope & Assumptions: News/TV content spans news articles (web news, wire services) and video transcripts (broadcast news, talk shows). Assume a large corpus (e.g. Infini-News’s ~1.35B articles) in many languages (English dominates ~500M articles, plus Spanish, German, Chinese, etc). Time ranges may span years to current day. Sources could include major broadcasters (CNN, BBC), newswires (AP), and streaming transcripts. Pitfalls: Metadata (title, date, source URL, language, channel, speaker) is often incomplete or inconsistent. For example, automated language/country tags can err (country-code TLDs may mislead locale). Publication dates may be missing or wrong. Caption/OCR text from videos may be out-of-sync or inaccurate. We may not know query distribution a priori – we assume general news queries (topics, named entities) with some mix of entity-specific (exact-match) and semantic queries.
 
-## 4. Fix the NMS / ground-truth tolerance mismatch
-Temporal NMS runs at ±2.0s but visual benchmark ground truth snaps at ±1.5s. Audit whether NMS is silently suppressing keyframes that fall within its own radius but outside GT tolerance — could be costing recall on borderline cases for free.
+Improvements: Standardize and enrich metadata. Use multiple language detectors (e.g. GlotLID, FastText) to tag each article. Infer country via domain or content (with human review for errors). Merge duplicate or syndicated articles (news agencies) to avoid bias. Normalize timestamps (UTC) and create time-based indices for recency. Extract additional tags (section, author, topics via NER). For TV shows, align transcripts with program schedule metadata.
 
-## 5. Standing translation quality eval
-The SSE parsing bug caused a +182% relative recall jump once fixed — translation quality was silently capping performance. Build a small regression test (even ~50 hand-checked Vietnamese→English pairs) so a future plumbing bug doesn't go unnoticed for as long.
+Impact & Trade-offs: High-quality metadata enables effective filtering (e.g. restricting by date, language) and boosting (e.g. recency, source credibility). However, enriching metadata requires pipelines (language models, gazetteers) and manual spot checks (especially for low-resource languages). We assume varying metadata quality and plan experiments to measure sensitivity: e.g. ablating language tags or using coarse vs fine timestamps.
+Content Normalization (Transcripts, OCR, Captions)
 
-## 6. Fine-tune SigLIP (fallback, only if #1 doesn't fix saturation)
-Targets the intra-corpus collision problem (e.g. *Món Ngon Mỗi Ngày*'s 500+ near-duplicate cooking videos scoring 0.32–0.38 cosine against each other) that a stronger base encoder alone may not solve.
-- LoRA/adapter fine-tune, not full fine-tune — protects the general embedding space for other query categories.
-- Hard negative mining is the actual work: cluster by show/series or by high-cosine (>0.85) non-duplicate pairs within your existing 177K matrix, rather than random in-batch negatives.
-- Exploit SigLIP's sigmoid pairwise loss to weight hard-negative pairs asymmetrically, easier than restructuring batches for InfoNCE.
-- Hold out a slice of your 800-query benchmark untouched as a regression check against forgetting.
+Pitfalls: Raw transcripts (from ASR or closed captions) often lack punctuation/capitalization and contain spoken-language artifacts. E.g. raw ASR “march third twenty twenty four” vs normalized “March 3, 2024”. Without normalization, indexing may treat numbers or dates inconsistently. OCR from video overlays (tickers, headlines) can have artifacts.
 
----
+Improvements: Apply standard text normalization as a post-processing step. This includes adding punctuation and casing, converting numbers/dates/quantities to canonical forms, expanding common abbreviations, and removing transcription noise (e.g. “um”, “[applause]”). Use domain-specific rules: e.g. ensure named entities from TV (person/place names) are captured. For OCR text, apply dictionary-based correction. The VOCR study shows that extracting on-screen text is especially beneficial for named-entity queries: overlay text significantly boosts recall (often more than ASR for person names). Thus pipeline: (1) segment transcripts (sentence/speaker); (2) normalize with rule-based + ML models; (3) merge ASR and OCR text into single index text or linked fields.
 
-Separately, from the earlier pipeline-quality pass (decoding/preprocessing side, not retrieval):
+Impact & Trade-offs: Normalization greatly improves retrieval consistency. For example, the ASR-normalization article notes that normalization “ensures transcripts are usable” by systems. Better formatting helps keyword matching (capitalized names, etc). The trade-off is added preprocessing cost. We recommend verifying normalization accuracy on a dev set (e.g. measure error rate in dates/numbers). As an experiment, compare retrieval with/without normalization on sample queries and measure recall/NDCG.
+Indexing Strategies
 
-## 7. Scene-change filtering on top of NONKEY keyframe extraction
-Pure I-frame sampling can over- or under-sample depending on GOP length; add histogram/SSIM-based dedup and gap-filling for long silent stretches.
+Current Pitfalls: Simple inverted indexes (Lucene/Elasticsearch) on raw text may ignore important fields or context. Long transcripts need chunking to respect query length. For video, naive indexing of every frame/image text is prohibitive. Ignoring multimodal cues (speech and text overlays) hurts recall. Large corpora require sharding/partitioning.
 
-## 8. Confirm resize + normalization exactly matches the SigLIP checkpoint's `preprocessor_config.json`
-Aspect-ratio handling and the `(x/127.5) - 1.0` normalization formula need to match the specific checkpoint — a mismatch here degrades quality silently, no errors thrown.
+Improvements: Use a hybrid index strategy. Keep a sparse index (BM25) for exact-match signals and keywords. Index text at multiple granularities: articles, paragraphs, captions. Optionally use learned sparse representations (e.g. SPLADE) to expand terms (see ColBERT discussion). For vector retrieval, use FAISS or a vector DB with efficient ANN (HNSW/IVF-PQ) for dense embeddings. FAISS supports many index types; choose by scale (flat for small corpora, IVF+PQ or HNSW for larger). For video, index key frames’ OCR as separate docs or as tags. Also build a multimodal index if video frames and transcripts share keys: e.g. align image features (CLIP) with text chunks, either by co-indexing or post-retrieval fusion.
 
-## 9. Log which decode path (PyAV vs OpenCV fallback) was used per `video_id`
-The two paths have very different sampling densities (NONKEY vs fixed 1.5s interval), which can bias downstream retrieval if left unaudited.
+Implement dual indexes in parallel: an inverted text index (Elasticsearch or Lucene) and a vector index (FAISS or Weaviate/Qdrant). Stage-1 retrieval will query both. Use metadata fields (title, source) in the sparse index via field boosting. For example, boosting title words or named-entity fields can improve ranking for entity queries. Eliminate stopwords, apply stemming/lemmatization for BM25.
 
-## 10. Cache "safe batch size" per GPU/resolution instead of re-discovering it via OOM every video
-Avoids repeatedly re-triggering the same OOM-retry cascade on similar videos.
+Impact & Trade-offs: A vector index (FAISS) enables semantic matching but uses more memory and GPU. FAISS itself is CPU/GPU portable; as Douze et al. note, “the optimal [index] depends on problem constraints”. We plan to benchmark multiple index types: brute-force (for small dev), HNSW (fast k-NN), and IVF+PQ (compressed) with various cluster counts. The trade-off is: inverted index gives low-latency exact matches, vector index finds deeper semantics. Maintenance cost: vector indexes need periodic re-embedding on updates. In experiments, we’ll test pure BM25, pure dense (e.g. DPR), and hybrid (fused) as baselines, measuring accuracy vs build/query time.
+Embedding Models (Text and Multimodal)
 
-## 11. Store model checkpoint version/hash in the metadata JSON
-Prevents silently mixing embeddings from different SigLIP versions in the same cache directory if you ever swap checkpoints (relevant now that you're switching encoders).
+Pitfalls: Off-the-shelf sparse methods miss paraphrases. News content uses jargon/aliases (e.g. “white house spokesman” vs “press secretary”). Dense encoders trained on general QA (e.g. DPR on NQ) may not cover news style or long articles well. Video frames provide context (logos, scene), but typical text-only models ignore these.
+
+Improvements (Text): Fine-tune dual-encoder models (like DPR or ANCE) on news Q&A or query pairs. DPR (BERT bi-encoder) showed 9–19% absolute gains over BM25 in QA retrieval. ANCE’s ANN-negative training yields even better recall and 100× speed-up at inference. Use multilingual versions if needed (mDPR). Sentence-transformers (SBERT) or ColBERT (late-interaction) can capture token-level nuance. We recommend evaluating both: DPR’s whole-document scoring vs ColBERT’s fine-grained matches. SPLADE or uniCOIL can be explored as learned sparse alternatives (train a BERT to predict sparse weights).
+
+For each model, tune: embedding dimension (768 typical), batch size, negative mining strategy (in-batch vs ANN negatives like ANCE). Domain-specific pretraining (e.g. continued MLM on news text) may improve embeddings. As a concrete hyperparameter, try learning rates ~1e-5–3e-5, temperature for dot-product scaling, and negative pool size 8–32.
+
+Improvements (Multimodal): If video frames are available, incorporate image embeddings. For example, extract key frames and index their CLIP embeddings alongside transcripts (or use joint models). Recent work (aligned visual captions) shows linking video content into retrieval. We can embed frame-level OCR text or images using a vision model and append to text embeddings or use as separate retrieval paths (fusion).
+
+Expected Impact: Dense models capture synonyms and context (e.g. DPR finds “villain” for query “bad guy” in LOTR), boosting recall especially on paraphrastic queries. ColBERT further allows token-wise matches at low extra cost. Hybrid CNN–Transformer (video text + image) models could catch queries like “logo of show” or “scene from interview,” though simpler text methods suffice for many news tasks. All improvements incur extra memory (storing embeddings) and compute (GPUs for encoding) vs BM25, so the table below compares approaches.
+Retrieval Architectures (Sparse, Dense, Hybrid)
+
+Sparse vs Dense vs Hybrid: We adopt a hybrid first-stage retrieval. As multiple sources advise, neither BM25 nor pure dense wins on all queries. BM25 is best for exact-mention queries (codes, names), while dense encoders excel for semantic questions. In practice, we run both in parallel and fuse.
+
+Fusion: Use Reciprocal Rank Fusion (RRF) to combine BM25 and ANN results. RRF is robust and simple: take the top-K from each, assign scores 1/(k+const). Weaviate’s default RRF (k=60) is a good starting point. Adjust k for news domain (perhaps smaller if precision needed). Pitfall: vendor default fusion (e.g. Weaviate’s switch to “relative score fusion” in v1.24) can change results, so pin fusion type explicitly.
+
+Pipeline: The standard pipeline is (1) Dual Retrieval: query sparse index + dense ANN index in parallel; (2) Fusion: merge top results (RRF or weighted sum); (3) Rerank: apply a cross-encoder on the fused top candidates. This three-stage approach is the current best practice. The cross-encoder stage (e.g. BERT with query-document input) refines relevance at ~negligible additional precision but should only see ~50–200 candidates due to O(n) cost.
+
+Pitfalls: Early BM25-only systems will miss synonyms, while dense-only will miss rare or new terms (e.g. news ticker slang). If fused incorrectly, one modality can dominate. We avoid naive hybrid indexes (which struggle due to very different vector distributions) and opt for separate indexes. Also, cold-start (no training queries) can hurt dense retrieval; we mitigate by careful negative sampling and maybe synthetic query generation (see Query Understanding).
+Reranking and Cross-Encoders
+
+Pitfalls: First-stage bi-encoder retrieval scores are coarse and ignore fine-grained query-document interactions. As [13] notes, bi-encoders “encode query and document independently,” missing nuanced relevance. A cross-encoder (BERT-style scoring of [Q;D]) catches such interactions but is too slow for first-stage.
+
+Improvements: Use a two-stage reranking. After fusion, feed top-N (e.g. 50–200) documents into a BERT cross-encoder (or LLM-based) to rescore. This improves precision (e.g. slight boosts in nDCG/MRR). For example, the hybrid blog notes that ColBERT (which is like a lightweight cross-encoder) can process top candidates with far less cost. We can use a smaller BERT (DistilBERT or TinyBERT) or commercial APIs (Cohere/Voyage) if latency allows. Parameter: N (rerank depth) should match latency budget (typically 50-100 with p99 in tens of ms).
+
+Impact & Trade-offs: Reranking yields modest accuracy gains at a significant cost. As [15] warns, a cross-encoder is not for all documents (“architecturally incorrect to apply at query-time over millions”). It’s O(N) per query. In practice, the added latency is small (~few ms per 100 docs) if batched on GPU, and yields more relevant top-k. We will compare pipelines with and without reranking on dev queries. For trade-off, we might only rerank when the BM25+ANN list is ambiguous (e.g. low scores).
+Query Understanding
+
+Pitfalls: Queries for news/TV can be short headlines or conversational requests. Without query logs, coverage of likely queries is unknown. Rare terms or idiosyncratic phrasing (colloquial names, broken queries) challenge exact retrieval.
+
+Improvements: 1) Query Expansion/Rewriting: Preprocess queries to improve recall. This may include spell-correction, stop-word removal, and adding synonyms. As NVIDIA notes, RAG systems often expand queries via context or synonyms (e.g. append “- news” or expand acronyms). We can use thesauri or a small GPT-style rewriter to generate paraphrases. 2) Synthetic Query Generation: If no real logs, generate synthetic queries from the corpus. For example, the News Reporter framework uses an LLM with “Self-Instruct” to make ~64K QA pairs from transcripts. We can similarly produce question/keyword queries from article headlines or video transcripts to form a test set. 3) Topic Profiling: Classify news articles into topics; then create prototypical queries per topic (e.g. “latest on election fraud”, “script details of new sci-fi TV show”).
+
+Expected Impact: Better queries yield better retrieval. We’ll implement a small expansion lexicon for common news synonyms (e.g. “US president” → “President of the United States”), and tune it by evaluating candidate queries on a held-out set. Synthetic queries (e.g. LLM-generated QAs) allow offline training/eval in lieu of logs. We assume query lengths ~5–15 terms, and will test robustness by varying query types (exact, natural language, keyword).
+Relevance Labeling and Evaluation Metrics
+
+Relevance Labeling: Constructing qrels (ground-truth relevance) for news/TV is labor-intensive. Options: sample queries and have annotators mark relevant docs; or approximate by “question answering” (treat transcripts as contexts). The News Reporter dataset [3] (though focused on QA) illustrates deriving queries (questions) from content. One could use such QA pairs as pseudo-training; true evaluation should still include manual checks. If queries come from logs, clicks could proxy relevance (implicit feedback). We will assume a small manually annotated test set (e.g. 100 queries with graded relevance).
+
+Metrics: Use standard IR metrics. Precision/recall are too coarse; we focus on rank-aware metrics. Common metrics are Recall@K, MRR, MAP@K, nDCG@K. For news, nDCG@10 and MRR@10 are typical (see MS MARCO, TREC DL standards). Weaviate’s blog confirms these choices. We will report at least Recall@100 (coverage) and nDCG@10, and Mean Average Precision. For single-answer queries, MRR is also informative. Offline metrics are computed on held-out queries with the known relevant set. We will use a standard toolkit (e.g. pytrec_eval).
+
+Pitfalls: If relevance judgments are shallow (1-2 per query), metrics have high variance. To mitigate, collect multiple judgments per query and use graded relevance (e.g. 2=exact, 1=partial). We’ll also perform statistical significance testing (paired bootstrap or Wilcoxon signed-rank) when comparing systems.
+Offline and Online Evaluation Protocols
+
+Offline: Split synthetic/collected queries into dev/test. Evaluate each model (BM25, dense, hybrid, etc.) on test queries, computing metrics as above. Use paired tests (e.g. bootstrap resampling) to assess if observed differences are significant (p<0.05). Incorporate ablation tests (e.g. with/without reranker, with different chunk sizes). The digital applied guide notes that without an NDCG/MRR baseline, one “cannot measure whether any iteration actually improved quality”, so we will ensure a stable baseline (vanilla BM25) for comparison.
+
+Online: In production, run A/B tests comparing retrieval variants. Key metrics: CTR on clicked results, dwell time, success (did user get answer). For example, if a reranker is introduced, measure if the “A” bucket sees higher click-through on top result. The Pinecone blog notes that offline improvements should translate to user satisfaction. However, beware novelty bias. We assume any pipeline candidate can be A/B tested, and plan to log query->click and session data.
+Error Analysis
+
+Analyzing failures guides refinement. We plan a two-pronged error analysis: (1) Quantitative: Break down performance by query type (entity vs concept vs long/short) and by document type (e.g. daily news vs archival). (2) Qualitative: For selected queries where systems disagree (e.g. BM25 top but hybrid misses, or vice versa), inspect errors. Common issues might be ASR mis-recognition (e.g. homophones), acronym/alias mismatches, or cross-lingual misses. For example, the VOCR study found named-entity queries especially helped by on-screen text; if our system still misses person names, we add more OCR. We will prepare an error analysis table listing sample queries (with intent), true relevant docs, and candidate results from each model, to identify patterns.
+Deployment Considerations (Latency, Memory, Scalability)
+
+Latency: Sparse retrieval (BM25) is fast (sub-ms per query for moderate indexes). Dense ANN search (FAISS HNSW) typically runs in 10–100ms depending on vector size and index parameters. We must budget retrieval + fusion + rerank under target latency (e.g. <200ms). Cross-encoder rerank on ~100 docs adds only a few ms on GPU. We must ensure the pipeline “retrieve then rerank” is respected. Use batching and GPU acceleration.
+
+Memory: BM25 index size ~total words×inverted lists (small). Dense indexes: E.g. 768-dim floats per chunk. A DPR 10M-doc index uses ~60GB (as per one report). We can compress via PQ or float16. We should also consider quantized or pre-computed embeddings to reduce space. The Faiss paper notes that the right index choice balances memory vs accuracy.
+
+Scalability: The system should handle growth (e.g. daily new articles). We plan periodic bulk re-indexing (nightly) and incremental updates (new docs). Index partitioning or sharding (by time or source) may help. For very large corpora, distributed vector DBs (e.g. Pinecone, Milvus) can be used, many of which build on FAISS algorithms. We recommend starting with a single-node FAISS for prototypes, then scaling out.
+
+Cost: Consider hardware. GPUs speed up dense search, but CPU-only ANN (HNSWlib, ScaNN) can suffice if dimension is moderate. The searchatlas analysis suggests BM25 cost is negligible (∼$0.01–0.1 per million queries) vs dense (requires GPUs). In our experiments, we’ll measure actual latency/memory on target hardware (CPU vs GPU) to guide production planning.
+Experimental Plan
+
+    Datasets: Use a corpus of news articles + TV transcripts (e.g. TRECVID or custom). If possible, leverage existing benchmarks (MS MARCO News, TREC News datasets). If none, create one via scraping or the provided data. For multilingual assumptions, we will test English primarily and simulate others (e.g. using translation).
+    Queries: Collect real queries if available. Otherwise, generate synthetic queries (LLM-based Q/A, or use headlines). Include a mix of entity vs descriptive.
+    Baselines: BM25 (via Lucene) and vanilla DPR (trained on general QA) as first baselines. Possibly DPR+doc2query augmentation.
+    Models: Train (or fine-tune) DPR and ColBERT on a small set of news QAs. Train ANCE on news if labels exist. Use a learned sparse model (e.g. SPLADE or uniCOIL) trained on a subset. Set up a hybrid retrieval (BM25+ANN). Also a pipeline with BM25+ANN+RRF+cross-encoder (e.g. BERT-base).
+    Metrics: Report Recall@100, nDCG@10, MAP@100, MRR@10. Compute 95% confidence intervals or p-values (e.g. paired t-test) to compare. Use Pearson’s or another reliability metric if needed.
+    Statistical Tests: For metric differences (nDCG etc) we’ll apply the paired Student’s t-test or Wilcoxon signed-rank test. The Pinecone guide suggests these offline tests. If using multiple queries, we expect to treat each query’s score as a sample.
+
+The table below outlines candidate approaches (example values are illustrative):
+Approach	nDCG@10	Recall@100	Latency/Query	Memory (index)	Notes
+BM25 (Lucene)	~0.58	~0.50	~1–5 ms	~~0.5GB per M docs	Fast, exact-match; poor paraphrase recall.
+DPR (dense only)	~0.72	~0.65	~~50–100 ms**	~~60GB per 10M docs**	Good semantic matching; needs GPU.
+ANCE (dense)	~0.75	~0.68	~~50–100 ms	~~60GB per 10M	Better negatives than DPR.
+ColBERT (late-int)	~0.75	~0.67	~~20–50 ms	~~4× fewer FLOPs	Token-level matching; offline doc encode.
+Hybrid (BM25+ANN)	~0.85	~0.78	~~20–100 ms	~~BM25 + ANN costs	Combines strengths; e.g. +15–30% recall.
++ Reranker (BERT)	~0.88	~0.80	~~100–200 ms	+300MB (BERT)	Cross-encoder refines top results; costly.
+
+(**) Latency and memory depend on hardware; GPU used for dense. NDCG numbers are illustrative, drawn from similar tasks. Exact values will be measured.
+
+Finally, we suggest visualizations: a mermaid flowchart of the pipeline (data → index → retrieval → rerank), charts of metric improvements (e.g. bar chart of nDCG gains for each model), and an example error analysis table (queries vs. model outputs) to highlight failure modes. These will clarify the proposed improvements.
+
+Sources: We cite peer-reviewed and official sources wherever possible: DPR, ColBERT, ANCE, FAISS, hybrid methods, RRF/fusion best practices, query normalization, VOCR for news, and industry blogs (DigitalApplied, Pinecone) for practical guidance. These ensure our recommendations are evidence-based and up-to-date.
