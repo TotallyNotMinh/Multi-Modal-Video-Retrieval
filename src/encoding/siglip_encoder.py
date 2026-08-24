@@ -12,12 +12,14 @@ if not hasattr(np, "ulong"):
 
 from PIL import Image
 from typing import List, Union, Optional
-from transformers import AutoImageProcessor, AutoModel
+import transformers
+transformers.logging.set_verbosity_error()
+from transformers import AutoImageProcessor, SiglipVisionModel
 
 
 class SigLIPEncoder:
     """
-    High-resolution Vision and Text Encoder using Google SigLIP (SO400M-patch14-384).
+    High-resolution Vision Encoder using Google SigLIP (SO400M-patch14-384).
     Outputs 1152-dimensional L2-normalized embeddings.
 
     VRAM Maximization & Adaptive OOM Auto-Recovery:
@@ -43,13 +45,10 @@ class SigLIPEncoder:
         print(f"[SigLIPEncoder] Loading {model_name} on {self.device} (FP16={self.use_fp16})...")
         try:
             self.processor = AutoImageProcessor.from_pretrained(model_name, local_files_only=True)
-            self.model = AutoModel.from_pretrained(model_name, local_files_only=True, low_cpu_mem_usage=False)
+            self.model = SiglipVisionModel.from_pretrained(model_name, local_files_only=True, torch_dtype=torch.float16 if self.use_fp16 else torch.float32)
         except Exception:
             self.processor = AutoImageProcessor.from_pretrained(model_name)
-            self.model = AutoModel.from_pretrained(model_name, low_cpu_mem_usage=False)
-
-        if self.use_fp16:
-            self.model = self.model.half()
+            self.model = SiglipVisionModel.from_pretrained(model_name, torch_dtype=torch.float16 if self.use_fp16 else torch.float32)
 
         self.model.to(self.device)
         self.model.eval()
@@ -73,17 +72,16 @@ class SigLIPEncoder:
                     tensor_batch = tensor_batch.float()
                 # Direct CUDA normalization: (x / 255.0 - 0.5) / 0.5 = x / 127.5 - 1.0
                 pixel_values = tensor_batch.div_(127.5).sub_(1.0)
-                image_features = self.model.get_image_features(pixel_values=pixel_values)
+                outputs = self.model(pixel_values=pixel_values)
                 del tensor_batch
             else:
                 inputs = self.processor(images=batch_images, return_tensors="pt").to(self.device)
                 if self.use_fp16:
                     inputs["pixel_values"] = inputs["pixel_values"].half()
-                image_features = self.model.get_image_features(**inputs)
+                outputs = self.model(**inputs)
                 del inputs
 
-            if not isinstance(image_features, torch.Tensor):
-                image_features = getattr(image_features, "pooler_output", image_features[0])
+            image_features = getattr(outputs, "pooler_output", outputs[0] if isinstance(outputs, (tuple, list)) else outputs)
             norms = image_features.norm(dim=-1, keepdim=True).clamp(min=1e-12)
             image_features = image_features / norms
             out = image_features.cpu().numpy().astype(np.float16 if self.use_fp16 else np.float32)
