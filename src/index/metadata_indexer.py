@@ -22,6 +22,8 @@ class MetadataIndexer:
         cache_dir: str = "cache"
     ):
         self.media_info_dir = media_info_dir
+        if not os.path.exists(media_info_dir) and os.path.exists("cache/media-info-aic25-b1/media-info"):
+            self.media_info_dir = "cache/media-info-aic25-b1/media-info"
         self.asr_dir = asr_dir
         self.ocr_dir = ocr_dir
         self.cache_dir = cache_dir

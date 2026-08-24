@@ -8,6 +8,8 @@ class FrameMapper:
     Handles mapping between keyframe numbers (n or '001'), pts_time, fps, and absolute frame_idx.
     """
     def __init__(self, map_dir: str = "data/map-keyframes-aic25-b1/map-keyframes"):
+        if not os.path.exists(map_dir) and os.path.exists("cache/map-keyframes-aic25-b1/map-keyframes"):
+            map_dir = "cache/map-keyframes-aic25-b1/map-keyframes"
         self.map_dir = map_dir
         self._cache: Dict[str, pd.DataFrame] = {}
 

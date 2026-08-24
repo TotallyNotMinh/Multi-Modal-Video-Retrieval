@@ -18,6 +18,8 @@ class ObjectIndexer:
         min_conf: float = 0.3
     ):
         self.objects_dir = objects_dir
+        if not os.path.exists(objects_dir) and os.path.exists("cache/objects-aic25-b1/objects"):
+            self.objects_dir = "cache/objects-aic25-b1/objects"
         self.cache_dir = cache_dir
         self.min_conf = min_conf
         os.makedirs(cache_dir, exist_ok=True)
