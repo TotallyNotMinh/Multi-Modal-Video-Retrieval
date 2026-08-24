@@ -201,32 +201,6 @@ def extract_hybrid_keyframes_from_video(
     return frames_rgb, meta_list
 
 
-def _mp_worker(
-    in_queue: mp.Queue,
-    out_queue: mp.Queue,
-    target_size: Tuple[int, int],
-    max_gap_sec: float,
-    min_gap_sec: float,
-    preserve_aspect: bool
-):
-    """Background worker process: decodes video frames in parallel across CPU cores."""
-    while True:
-        vid_path = in_queue.get()
-        if vid_path is None:
-            break
-        try:
-            frames, meta = extract_hybrid_keyframes_from_video(
-                vid_path=vid_path,
-                target_size=target_size,
-                max_gap_sec=max_gap_sec,
-                min_gap_sec=min_gap_sec,
-                preserve_aspect=preserve_aspect
-            )
-            out_queue.put((vid_path, frames, meta))
-        except Exception:
-            out_queue.put((vid_path, [], []))
-
-
 def extract_all_siglip_features(
     videos_root: str = "data",
     output_dir: str = "cache/siglip_features",
@@ -292,64 +266,40 @@ def extract_all_siglip_features(
         print("[✓] All videos already extracted.")
         return
 
-    # Setup multi-process decoding pipeline
-    in_queue = mp.Queue(maxsize=len(pending) + num_workers)
-    out_queue = mp.Queue(maxsize=num_workers * 2)
-
-    for p in pending:
-        in_queue.put(p)
-    for _ in range(num_workers):
-        in_queue.put(None)
-
-    workers = []
-    for _ in range(num_workers):
-        w = mp.Process(
-            target=_mp_worker,
-            args=(in_queue, out_queue, (384, 384), max_gap_sec, min_gap_sec, preserve_aspect),
-            daemon=True
-        )
-        w.start()
-        workers.append(w)
-
     total_frames_extracted = 0
     t0 = time.time()
     processed_count = 0
 
     with tqdm(total=len(pending), desc=f"Extracting SigLIP (Shard {shard_id}/{num_shards})") as pbar:
-        while processed_count < len(pending):
-            try:
-                item = out_queue.get(timeout=2.0)
-            except Exception:
-                # Check if all worker processes are dead
-                alive_workers = [w for w in workers if w.is_alive()]
-                if not alive_workers and out_queue.empty():
-                    print("\n[!] All workers terminated. Exiting queue loop cleanly.")
-                    break
-                continue
-
-            vid_path, frames_rgb, meta_list = item
+        for vid_path in pending:
             vid_name = os.path.splitext(os.path.basename(vid_path))[0]
             out_npy = os.path.join(output_dir, f"{vid_name}.npy")
             out_meta = os.path.join(meta_dir, f"{vid_name}.json")
 
-            if frames_rgb:
-                embeddings = encoder.encode_images(frames_rgb, batch_size=batch_size)
-                tmp_npy = f"{out_npy}.tmp.{os.getpid()}.npy"
-                tmp_meta = f"{out_meta}.tmp.{os.getpid()}.json"
-                np.save(tmp_npy, embeddings)
-                with open(tmp_meta, "w", encoding="utf-8") as f:
-                    json.dump(meta_list, f)
-                os.replace(tmp_npy, out_npy)
-                os.replace(tmp_meta, out_meta)
-                total_frames_extracted += len(meta_list)
+            try:
+                frames_rgb, meta_list = extract_hybrid_keyframes_from_video(
+                    vid_path=vid_path,
+                    target_size=(384, 384),
+                    max_gap_sec=max_gap_sec,
+                    min_gap_sec=min_gap_sec,
+                    preserve_aspect=preserve_aspect
+                )
+
+                if frames_rgb:
+                    embeddings = encoder.encode_images(frames_rgb, batch_size=batch_size)
+                    tmp_npy = f"{out_npy}.tmp.{os.getpid()}.npy"
+                    tmp_meta = f"{out_meta}.tmp.{os.getpid()}.json"
+                    np.save(tmp_npy, embeddings)
+                    with open(tmp_meta, "w", encoding="utf-8") as f:
+                        json.dump(meta_list, f)
+                    os.replace(tmp_npy, out_npy)
+                    os.replace(tmp_meta, out_meta)
+                    total_frames_extracted += len(meta_list)
+            except Exception as e:
+                print(f"\n[!] Error processing {vid_name}: {e}")
 
             processed_count += 1
             pbar.update(1)
-
-    for w in workers:
-        if w.is_alive():
-            w.terminate()
-        w.join(timeout=1.0)
 
     elapsed = time.time() - t0
     print(f"\n[✓] SigLIP Extraction complete! Processed {processed_count}/{len(pending)} videos ({total_frames_extracted} frames) "
