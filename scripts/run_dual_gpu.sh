@@ -38,13 +38,23 @@ print('[✓] Model cached successfully.')
 # 2. Launch isolated GPU processes
 echo ""
 echo "[*] Spawning GPU 0 process (CUDA:0, Shard 0/2)..."
-python -u scripts/extract_siglip_features.py     --num-shards 2     --shard-id 0     --device cuda:0     --batch-size 32     --exclude-list "$MANIFEST" > cache/logs/gpu_0.log 2>&1 &
+python -u scripts/extract_siglip_features.py \
+    --num-shards 2 \
+    --shard-id 0 \
+    --device cuda:0 \
+    --batch-size 64 \
+    --exclude-list "$MANIFEST" > cache/logs/gpu_0.log 2>&1 &
 PID0=$!
 
 sleep 3
 
 echo "[*] Spawning GPU 1 process (CUDA:1, Shard 1/2)..."
-python -u scripts/extract_siglip_features.py     --num-shards 2     --shard-id 1     --device cuda:1     --batch-size 32     --exclude-list "$MANIFEST" > cache/logs/gpu_1.log 2>&1 &
+python -u scripts/extract_siglip_features.py \
+    --num-shards 2 \
+    --shard-id 1 \
+    --device cuda:1 \
+    --batch-size 64 \
+    --exclude-list "$MANIFEST" > cache/logs/gpu_1.log 2>&1 &
 PID1=$!
 
 echo "[✓] GPU 0 (PID: $PID0) and GPU 1 (PID: $PID1) running in background."

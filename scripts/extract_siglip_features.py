@@ -243,16 +243,14 @@ def extract_all_siglip_features(
         print("[✓] All videos already extracted.")
         return
 
-    total_frames_extracted = 0
-    t0 = time.time()
-    processed_count = 0
+    # Setup asynchronous background prefetch decoding thread
+    import queue
+    import threading
 
-    with tqdm(total=len(pending), desc=f"Extracting SigLIP (Shard {shard_id}/{num_shards})") as pbar:
+    decode_queue = queue.Queue(maxsize=2)
+
+    def _prefetch_worker():
         for vid_path in pending:
-            vid_name = os.path.splitext(os.path.basename(vid_path))[0]
-            out_npy = os.path.join(output_dir, f"{vid_name}.npy")
-            out_meta = os.path.join(meta_dir, f"{vid_name}.json")
-
             try:
                 frames_rgb, meta_list = extract_hybrid_keyframes_from_video(
                     vid_path=vid_path,
@@ -261,7 +259,29 @@ def extract_all_siglip_features(
                     min_gap_sec=min_gap_sec,
                     preserve_aspect=preserve_aspect
                 )
+                decode_queue.put((vid_path, frames_rgb, meta_list))
+            except Exception as e:
+                decode_queue.put((vid_path, [], []))
+        decode_queue.put(None)
 
+    prefetch_thread = threading.Thread(target=_prefetch_worker, daemon=True)
+    prefetch_thread.start()
+
+    total_frames_extracted = 0
+    t0 = time.time()
+    processed_count = 0
+
+    with tqdm(total=len(pending), desc=f"Extracting SigLIP (Shard {shard_id}/{num_shards})") as pbar:
+        while True:
+            item = decode_queue.get()
+            if item is None:
+                break
+            vid_path, frames_rgb, meta_list = item
+            vid_name = os.path.splitext(os.path.basename(vid_path))[0]
+            out_npy = os.path.join(output_dir, f"{vid_name}.npy")
+            out_meta = os.path.join(meta_dir, f"{vid_name}.json")
+
+            try:
                 if frames_rgb:
                     embeddings = encoder.encode_images(frames_rgb, batch_size=batch_size)
                     tmp_npy = f"{out_npy}.tmp.{os.getpid()}.npy"
@@ -277,6 +297,8 @@ def extract_all_siglip_features(
 
             processed_count += 1
             pbar.update(1)
+
+    prefetch_thread.join(timeout=2.0)
 
     elapsed = time.time() - t0
     print(f"\n[✓] SigLIP Extraction complete! Processed {processed_count}/{len(pending)} videos ({total_frames_extracted} frames) "
